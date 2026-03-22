@@ -1,7 +1,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
-extern "kernel32" fn GetCurrentProcessId() callconv(std.os.windows.WINAPI) u32;
+extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
 
 pub const SessionManager = struct {
     session_name: []const u8,

@@ -254,9 +254,11 @@ pub const ControlPlane = struct {
     }
 };
 
+extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+
 fn getCurrentPid() u32 {
     if (@import("builtin").os.tag == .windows) {
-        return std.os.windows.kernel32.GetCurrentProcessId();
+        return GetCurrentProcessId();
     } else {
         return @intCast(std.posix.getpid());
     }
