@@ -1,6 +1,6 @@
 .{
-    .name = .@"zig-control-plane",
-    .version = .{ 0, 1, 0, 0 },
-    .fingerprint = 0x0,
+    .name = .zig_control_plane,
+    .version = "0.1.0",
+    .fingerprint = 0xa6d39403fd581105,
     .paths = .{""},
 }
