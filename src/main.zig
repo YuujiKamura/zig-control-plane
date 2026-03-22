@@ -6,8 +6,7 @@ pub const tab_id = @import("tab_id.zig");
 pub const session = @import("session.zig");
 pub const utils = @import("utils.zig");
 
-// pipe_server import will be added when Task 4 is merged
-// pub const pipe_server = @import("pipe_server.zig");
+pub const pipe_server = @import("pipe_server.zig");
 
 pub const Provider = struct {
     ctx: *anyopaque,
@@ -269,7 +268,7 @@ test {
     _ = protocol;
     _ = tab_id;
     _ = session;
-    // pipe_server tests are integration-only
+    _ = pipe_server;
     _ = utils;
 }
 
