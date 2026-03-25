@@ -241,7 +241,7 @@ pub const ControlPlane = struct {
                 const tab_index = self.resolveTab(inp.tab);
                 // Wrap payload in bracketed paste mode: ESC[200~ + payload + ESC[201~ + CR
                 const prefix = "\x1b[200~";
-                const suffix = "\x1b[201~\r";
+                const suffix = "\x1b[201~";
                 var buf: [64 * 1024]u8 = undefined;
                 const total = prefix.len + inp.payload.len + suffix.len;
                 if (total > buf.len) return try protocol.formatError(alloc, self.session_name, "PASTE_TOO_LARGE");
@@ -532,7 +532,7 @@ test "handleRequest PASTE" {
     defer std.testing.allocator.free(resp);
     try std.testing.expectEqualStrings("QUEUED|test-session|PASTE\n", resp);
     // Verify the payload was wrapped in bracketed paste mode
-    const expected = "\x1b[200~hello\x1b[201~\r";
+    const expected = "\x1b[200~hello\x1b[201~";
     try std.testing.expectEqualStrings(expected, mock_state.last_input.?);
     try std.testing.expect(mock_state.last_input_raw);
 }
