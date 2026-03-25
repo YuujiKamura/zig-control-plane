@@ -15,6 +15,7 @@ const SECURITY_ATTRIBUTES = w.SECURITY_ATTRIBUTES;
 
 extern "kernel32" fn ConnectNamedPipe(hNamedPipe: HANDLE, lpOverlapped: ?*OVERLAPPED) callconv(.winapi) BOOL;
 extern "kernel32" fn DisconnectNamedPipe(hNamedPipe: HANDLE) callconv(.winapi) BOOL;
+extern "kernel32" fn ResetEvent(hEvent: HANDLE) callconv(.winapi) BOOL;
 extern "kernel32" fn LocalFree(hMem: ?*anyopaque) callconv(.winapi) ?*anyopaque;
 
 extern "advapi32" fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -203,32 +204,129 @@ pub const PipeServer = struct {
         const event = w.CreateEventExW(null, null, CREATE_EVENT_MANUAL_RESET, EVENT_ALL_ACCESS) catch return;
         defer w.CloseHandle(event);
 
-        // Read request (up to 65536 bytes, 10s timeout)
         var buf: [65536]u8 = undefined;
-        var overlapped = std.mem.zeroes(OVERLAPPED);
-        overlapped.hEvent = event;
+        var carry: [65536]u8 = undefined;
+        var carry_len: usize = 0;
+        var persistent = false;
 
-        _ = k32.ReadFile(pipe, &buf, 65536, null, &overlapped);
+        while (!self.stop_flag.load(.monotonic)) {
+            // 1) Try to get a complete request line
+            const request = self.readRequestLine(pipe, event, &buf, &carry, &carry_len, persistent) orelse {
+                // null means disconnect, timeout (1-shot), or fatal error
+                return;
+            };
 
-        const wait_result = k32.WaitForSingleObject(event, 10000);
-        if (wait_result != WAIT_OBJECT_0) return;
+            // Empty line: in persistent mode just skip, in 1-shot mode we're done
+            if (request.len == 0) {
+                if (persistent) continue;
+                return;
+            }
 
-        const bytes_read = w.GetOverlappedResult(pipe, &overlapped, false) catch return;
-        if (bytes_read == 0) return;
+            // 2) Check for PERSIST handshake
+            if (std.mem.eql(u8, request, "PERSIST")) {
+                persistent = true;
+                writeAll(pipe, "OK|PERSIST\n");
+                continue;
+            }
 
-        // Trim trailing whitespace/newline
-        const raw = buf[0..bytes_read];
-        const request = std.mem.trimRight(u8, raw, &[_]u8{ '\r', '\n', ' ', '\t' });
-        if (request.len == 0) return;
+            // 3) Dispatch to handler
+            const response = self.handler(request, self.ctx, self.allocator);
+            defer self.allocator.free(response);
+            writeAll(pipe, response);
 
-        // Call handler
-        const response = self.handler(request, self.ctx, self.allocator);
-        defer self.allocator.free(response);
+            if (!persistent) break; // legacy 1-shot mode
+        }
+    }
 
-        // Write response (synchronous is fine for small responses)
+    /// Read one request line from the pipe. Returns the trimmed line content,
+    /// or null on disconnect / timeout (1-shot) / fatal error.
+    /// In persistent mode, a read timeout returns an empty slice (not null)
+    /// so the caller can loop and check the stop flag.
+    fn readRequestLine(
+        self: *PipeServer,
+        pipe: HANDLE,
+        event: HANDLE,
+        buf: *[65536]u8,
+        carry: *[65536]u8,
+        carry_len: *usize,
+        persistent: bool,
+    ) ?[]const u8 {
+        while (true) {
+            // Check carry buffer for a complete line
+            if (extractLine(carry[0..carry_len.*])) |info| {
+                const trimmed = std.mem.trimRight(u8, carry[0..info.line_end], &[_]u8{ '\r', '\n', ' ', '\t' });
+                // Shift remainder forward
+                const remaining = carry_len.* - info.next_start;
+                if (remaining > 0) {
+                    std.mem.copyForwards(u8, carry[0..remaining], carry[info.next_start..carry_len.*]);
+                }
+                carry_len.* = remaining;
+                return trimmed;
+            }
+
+            // No complete line — read more data from pipe
+            if (self.stop_flag.load(.monotonic)) return null;
+
+            var overlapped = std.mem.zeroes(OVERLAPPED);
+            overlapped.hEvent = event;
+            _ = ResetEvent(event);
+
+            const space = buf.len;
+            _ = k32.ReadFile(pipe, buf, @intCast(space), null, &overlapped);
+
+            const timeout: DWORD = if (persistent) 200 else 2000;
+            const wait_result = k32.WaitForSingleObject(event, timeout);
+
+            if (wait_result == WAIT_TIMEOUT) {
+                _ = k32.CancelIoEx(pipe, &overlapped);
+                if (persistent) {
+                    // No data yet — return empty slice so caller can check stop_flag
+                    return carry[0..0];
+                }
+                // 1-shot mode: for backward compat, treat buffered data as request
+                if (carry_len.* > 0) {
+                    const trimmed = std.mem.trimRight(u8, carry[0..carry_len.*], &[_]u8{ '\r', '\n', ' ', '\t' });
+                    carry_len.* = 0;
+                    return trimmed;
+                }
+                return null;
+            }
+            if (wait_result != WAIT_OBJECT_0) return null;
+
+            const bytes_read = w.GetOverlappedResult(pipe, &overlapped, false) catch return null;
+            if (bytes_read == 0) return null; // client disconnected
+
+            // Append to carry buffer
+            const new_total = carry_len.* + bytes_read;
+            if (new_total > carry.len) return null; // overflow
+            @memcpy(carry[carry_len.*..new_total], buf[0..bytes_read]);
+            carry_len.* = new_total;
+
+            // Loop back to try extractLine again
+        }
+    }
+
+    /// Write all bytes to the pipe (synchronous).
+    fn writeAll(pipe: HANDLE, data: []const u8) void {
         var written: DWORD = 0;
-        _ = k32.WriteFile(pipe, response.ptr, @intCast(response.len), &written, null);
+        _ = k32.WriteFile(pipe, data.ptr, @intCast(data.len), &written, null);
         _ = k32.FlushFileBuffers(pipe);
+    }
+
+    const LineInfo = struct {
+        line_end: usize, // index of end of line content (before \n or \r\n)
+        next_start: usize, // index of start of next line
+    };
+
+    /// Scan for the first newline in data. Returns the line boundaries or null.
+    fn extractLine(data: []const u8) ?LineInfo {
+        for (data, 0..) |c, i| {
+            if (c == '\n') {
+                const line_end = if (i > 0 and data[i - 1] == '\r') i - 1 else i;
+                return LineInfo{ .line_end = line_end, .next_start = i + 1 };
+            }
+        }
+        return null;
     }
 };
 
