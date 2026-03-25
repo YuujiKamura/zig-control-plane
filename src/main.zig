@@ -137,7 +137,10 @@ pub const ControlPlane = struct {
 
                 const tab_id_str = self.tab_mgr.getId(tab_index) orelse "?";
 
-                return try protocol.formatState(
+                // Compute content hash (FNV-1a 32-bit) of visible buffer
+                const content_hash = std.hash.Fnv1a_32.hash(buffer);
+
+                const base = try protocol.formatState(
                     alloc,
                     self.session_name,
                     self.pid,
@@ -150,6 +153,12 @@ pub const ControlPlane = struct {
                     active,
                     tab_id_str,
                 );
+                defer alloc.free(base);
+
+                // Append mode and content_hash fields.
+                // base ends with "\n", strip it, append new fields, re-add "\n".
+                const trimmed = std.mem.trimRight(u8, base, "\n");
+                return try std.fmt.allocPrint(alloc, "{s}|mode=unknown|content_hash={x:0>8}\n", .{ trimmed, content_hash });
             },
             .tail => |t| {
                 const tab_index = self.resolveTabOrActive(t.tab);
@@ -221,6 +230,20 @@ pub const ControlPlane = struct {
                 p.sendInput(ctx, inp.payload, true, tab_index);
                 // sendInput uses PostMessageW (fire-and-forget), so delivery is not confirmed.
                 return try std.fmt.allocPrint(alloc, "QUEUED|{s}|RAW_INPUT\n", .{self.session_name});
+            },
+            .paste => |inp| {
+                const tab_index = self.resolveTab(inp.tab);
+                // Wrap payload in bracketed paste mode: ESC[200~ + payload + ESC[201~ + CR
+                const prefix = "\x1b[200~";
+                const suffix = "\x1b[201~\r";
+                var buf: [64 * 1024]u8 = undefined;
+                const total = prefix.len + inp.payload.len + suffix.len;
+                if (total > buf.len) return try protocol.formatError(alloc, self.session_name, "PASTE_TOO_LARGE");
+                @memcpy(buf[0..prefix.len], prefix);
+                @memcpy(buf[prefix.len..][0..inp.payload.len], inp.payload);
+                @memcpy(buf[prefix.len + inp.payload.len ..][0..suffix.len], suffix);
+                p.sendInput(ctx, buf[0..total], true, tab_index);
+                return try std.fmt.allocPrint(alloc, "QUEUED|{s}|PASTE\n", .{self.session_name});
             },
             .new_tab => {
                 p.newTab(ctx);
@@ -300,8 +323,11 @@ fn mockReadBuffer(_: *anyopaque, _: ?usize, buf: []u8) usize {
     return len;
 }
 
+var mock_input_buf: [64 * 1024]u8 = undefined;
+
 fn mockSendInput(_: *anyopaque, text: []const u8, raw: bool, _: ?usize) void {
-    mock_state.last_input = text;
+    @memcpy(mock_input_buf[0..text.len], text);
+    mock_state.last_input = mock_input_buf[0..text.len];
     mock_state.last_input_raw = raw;
 }
 
@@ -427,6 +453,13 @@ test "handleRequest STATE" {
     try std.testing.expect(std.mem.startsWith(u8, resp, "STATE|test-session|"));
     // Should contain prompt=1 since mock buffer ends with "$ "
     try std.testing.expect(std.mem.indexOf(u8, resp, "prompt=1") != null);
+    // Should contain mode and content_hash fields
+    try std.testing.expect(std.mem.indexOf(u8, resp, "|mode=unknown|") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "|content_hash=") != null);
+    // content_hash should be 8 hex chars before the trailing newline
+    const hash_start = std.mem.indexOf(u8, resp, "content_hash=").? + "content_hash=".len;
+    const hash_end = std.mem.indexOfPos(u8, resp, hash_start, "\n") orelse resp.len;
+    try std.testing.expectEqual(@as(usize, 8), hash_end - hash_start);
 }
 
 test "handleRequest TAIL" {
@@ -482,6 +515,20 @@ test "handleRequest CLOSE_TAB" {
     defer std.testing.allocator.free(resp);
     try std.testing.expect(std.mem.startsWith(u8, resp, "ACK|test-session|CLOSE_TAB|0"));
     try std.testing.expectEqual(@as(?usize, 0), mock_state.close_tab_called);
+}
+
+test "handleRequest PASTE" {
+    var cp = try initTestCp();
+    defer cp.deinit();
+    // "aGVsbG8=" is base64 for "hello"
+    var line = "PASTE|agent|aGVsbG8=".*;
+    const resp = try cp.handleRequest(&line);
+    defer std.testing.allocator.free(resp);
+    try std.testing.expectEqualStrings("QUEUED|test-session|PASTE\n", resp);
+    // Verify the payload was wrapped in bracketed paste mode
+    const expected = "\x1b[200~hello\x1b[201~\r";
+    try std.testing.expectEqualStrings(expected, mock_state.last_input.?);
+    try std.testing.expect(mock_state.last_input_raw);
 }
 
 test "handleRequest deprecated commands" {

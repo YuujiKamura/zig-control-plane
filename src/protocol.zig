@@ -24,6 +24,7 @@ pub const Request = union(enum) {
     list_tabs,
     input: struct { from: []const u8, payload: []const u8, tab: TabTarget = .none },
     raw_input: struct { from: []const u8, payload: []const u8, tab: TabTarget = .none },
+    paste: struct { from: []const u8, payload: []const u8, tab: TabTarget = .none },
     new_tab,
     close_tab: TabTarget,
     switch_tab: TabTarget,
@@ -77,7 +78,7 @@ pub fn parse(line: []const u8) ParseError!Request {
         }
     }
 
-    if (std.mem.eql(u8, cmd, "INPUT") or std.mem.eql(u8, cmd, "RAW_INPUT")) {
+    if (std.mem.eql(u8, cmd, "INPUT") or std.mem.eql(u8, cmd, "RAW_INPUT") or std.mem.eql(u8, cmd, "PASTE")) {
         const from = it.next() orelse return ParseError.MissingField;
         const encoded = it.next() orelse return ParseError.MissingField;
         const tab_field = it.next();
@@ -91,6 +92,8 @@ pub fn parse(line: []const u8) ParseError!Request {
 
         if (std.mem.eql(u8, cmd, "INPUT")) {
             return .{ .input = .{ .from = from, .payload = payload, .tab = tab } };
+        } else if (std.mem.eql(u8, cmd, "PASTE")) {
+            return .{ .paste = .{ .from = from, .payload = payload, .tab = tab } };
         } else {
             return .{ .raw_input = .{ .from = from, .payload = payload, .tab = tab } };
         }
@@ -268,6 +271,23 @@ test "parse INPUT with base64 decode" {
             try std.testing.expectEqualStrings("agent", inp.from);
             try std.testing.expectEqualStrings("hello", inp.payload);
             switch (inp.tab) {
+                .id => |id| try std.testing.expectEqualStrings("t_001", id),
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse PASTE with base64 decode" {
+    // "aGVsbG8=" is base64 for "hello"
+    var line = "PASTE|agent|aGVsbG8=|id=t_001".*;
+    const req = try parse(&line);
+    switch (req) {
+        .paste => |p| {
+            try std.testing.expectEqualStrings("agent", p.from);
+            try std.testing.expectEqualStrings("hello", p.payload);
+            switch (p.tab) {
                 .id => |id| try std.testing.expectEqualStrings("t_001", id),
                 else => return error.TestUnexpectedResult,
             }
