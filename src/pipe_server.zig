@@ -48,6 +48,7 @@ pub const PipeServer = struct {
     handler: HandlerFn,
     ctx: *anyopaque,
     allocator: Allocator,
+    active_clients: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     pub fn init(allocator: Allocator, pipe_name: []const u8, handler: HandlerFn, ctx: *anyopaque) !PipeServer {
         const pipe_path_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, pipe_name);
@@ -69,6 +70,10 @@ pub const PipeServer = struct {
         if (self.thread) |t| {
             t.join();
             self.thread = null;
+        }
+        // Wait for any in-flight client handler threads to finish
+        while (self.active_clients.load(.acquire) > 0) {
+            std.Thread.sleep(10 * std.time.ns_per_ms);
         }
     }
 
@@ -102,25 +107,30 @@ pub const PipeServer = struct {
         }
     }
 
+    /// Context passed to each client-handler thread.
+    const ClientThreadCtx = struct {
+        server: *PipeServer,
+        pipe: HANDLE,
+    };
+
     fn serverIteration(self: *PipeServer, sa: *SECURITY_ATTRIBUTES) void {
         const pipe = k32.CreateNamedPipeW(
             self.pipe_path_w,
             PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
             PIPE_TYPE_BYTE | PIPE_WAIT,
-            1, // nMaxInstances
+            255, // nMaxInstances — PIPE_UNLIMITED_INSTANCES
             65536,
             65536,
             0,
             sa,
         );
         if (pipe == INVALID_HANDLE_VALUE) return;
-        defer {
-            _ = DisconnectNamedPipe(pipe);
-            w.CloseHandle(pipe);
-        }
 
         // Create manual-reset event for overlapped I/O
-        const event = w.CreateEventExW(null, null, CREATE_EVENT_MANUAL_RESET, EVENT_ALL_ACCESS) catch return;
+        const event = w.CreateEventExW(null, null, CREATE_EVENT_MANUAL_RESET, EVENT_ALL_ACCESS) catch {
+            w.CloseHandle(pipe);
+            return;
+        };
         defer w.CloseHandle(event);
 
         var overlapped = std.mem.zeroes(OVERLAPPED);
@@ -132,9 +142,30 @@ pub const PipeServer = struct {
         while (!self.stop_flag.load(.monotonic)) {
             const result = k32.WaitForSingleObject(event, 1000);
             if (result == WAIT_OBJECT_0) {
-                // Client connected — check if we should still serve
+                // Client connected — spawn a thread to handle it.
+                // The handler thread owns the pipe handle (disconnect + close).
                 if (!self.stop_flag.load(.monotonic)) {
-                    self.handleClient(pipe);
+                    const ctx = self.allocator.create(ClientThreadCtx) catch {
+                        _ = DisconnectNamedPipe(pipe);
+                        w.CloseHandle(pipe);
+                        return;
+                    };
+                    ctx.* = .{ .server = self, .pipe = pipe };
+                    // Increment before spawn so stop() cannot complete while thread is starting.
+                    _ = self.active_clients.fetchAdd(1, .acq_rel);
+                    const t = std.Thread.spawn(.{}, clientThread, .{ctx}) catch {
+                        _ = self.active_clients.fetchSub(1, .acq_rel);
+                        self.allocator.destroy(ctx);
+                        _ = DisconnectNamedPipe(pipe);
+                        w.CloseHandle(pipe);
+                        return;
+                    };
+                    t.detach();
+                    // Pipe ownership transferred to clientThread.
+                    // Main loop returns to create the next pipe instance.
+                } else {
+                    _ = DisconnectNamedPipe(pipe);
+                    w.CloseHandle(pipe);
                 }
                 return;
             } else if (result == WAIT_TIMEOUT) {
@@ -142,12 +173,30 @@ pub const PipeServer = struct {
                 continue;
             } else {
                 // Error
+                _ = DisconnectNamedPipe(pipe);
+                w.CloseHandle(pipe);
                 return;
             }
         }
 
         // Stopping — cancel pending connect
         _ = k32.CancelIoEx(pipe, &overlapped);
+        _ = DisconnectNamedPipe(pipe);
+        w.CloseHandle(pipe);
+    }
+
+    /// Runs on a dedicated thread per client. Owns the pipe handle.
+    /// active_clients was already incremented before spawn.
+    fn clientThread(ctx: *ClientThreadCtx) void {
+        const self = ctx.server;
+        const pipe = ctx.pipe;
+        self.allocator.destroy(ctx);
+        defer _ = self.active_clients.fetchSub(1, .acq_rel);
+        defer {
+            _ = DisconnectNamedPipe(pipe);
+            w.CloseHandle(pipe);
+        }
+        self.handleClient(pipe);
     }
 
     fn handleClient(self: *PipeServer, pipe: HANDLE) void {

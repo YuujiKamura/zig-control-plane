@@ -213,21 +213,20 @@ pub const ControlPlane = struct {
             .input => |inp| {
                 const tab_index = self.resolveTab(inp.tab);
                 p.sendInput(ctx, inp.payload, false, tab_index);
-                return try protocol.formatAck(alloc, self.session_name, self.pid);
+                // sendInput uses PostMessageW (fire-and-forget), so delivery is not confirmed.
+                return try std.fmt.allocPrint(alloc, "QUEUED|{s}|INPUT\n", .{self.session_name});
             },
             .raw_input => |inp| {
                 const tab_index = self.resolveTab(inp.tab);
                 p.sendInput(ctx, inp.payload, true, tab_index);
-                return try protocol.formatAck(alloc, self.session_name, self.pid);
+                // sendInput uses PostMessageW (fire-and-forget), so delivery is not confirmed.
+                return try std.fmt.allocPrint(alloc, "QUEUED|{s}|RAW_INPUT\n", .{self.session_name});
             },
             .new_tab => {
                 p.newTab(ctx);
-                const tab_count = p.tabCount(ctx);
-                try self.tab_mgr.syncTabs(tab_count);
-                // The new tab is the last one
-                const new_index = tab_count - 1;
-                const new_id = self.tab_mgr.getId(new_index) orelse "?";
-                return try std.fmt.allocPrint(alloc, "OK|{s}|NEW_TAB|{s}\n", .{ self.session_name, new_id });
+                // newTab posts asynchronously (PostMessageW) so tabCount is stale here.
+                // Return acknowledgement without claiming a specific tab ID.
+                return try std.fmt.allocPrint(alloc, "OK|{s}|NEW_TAB\n", .{self.session_name});
             },
             .close_tab => |tab_target| {
                 const tab_index = self.resolveTabOrActive(tab_target);
@@ -463,7 +462,7 @@ test "handleRequest NEW_TAB" {
     defer cp.deinit();
     const resp = try cp.handleRequest("NEW_TAB");
     defer std.testing.allocator.free(resp);
-    try std.testing.expect(std.mem.startsWith(u8, resp, "OK|test-session|NEW_TAB|"));
+    try std.testing.expectEqualStrings("OK|test-session|NEW_TAB\n", resp);
     try std.testing.expect(mock_state.new_tab_called);
 }
 
