@@ -155,10 +155,16 @@ pub const ControlPlane = struct {
                 );
                 defer alloc.free(base);
 
+                // Heuristic terminal mode detection (Issue #13):
+                // If inferPrompt detects a shell prompt, the terminal is likely in
+                // cooked/canonical mode (normal shell). Otherwise, a TUI app is
+                // probably running in raw mode (e.g., vim, Claude Code).
+                const mode_str = if (prompt) "cooked" else "raw";
+
                 // Append mode and content_hash fields.
                 // base ends with "\n", strip it, append new fields, re-add "\n".
                 const trimmed = std.mem.trimRight(u8, base, "\n");
-                return try std.fmt.allocPrint(alloc, "{s}|mode=unknown|content_hash={x:0>8}\n", .{ trimmed, content_hash });
+                return try std.fmt.allocPrint(alloc, "{s}|mode={s}|content_hash={x:0>8}\n", .{ trimmed, mode_str, content_hash });
             },
             .tail => |t| {
                 const tab_index = self.resolveTabOrActive(t.tab);
@@ -453,8 +459,8 @@ test "handleRequest STATE" {
     try std.testing.expect(std.mem.startsWith(u8, resp, "STATE|test-session|"));
     // Should contain prompt=1 since mock buffer ends with "$ "
     try std.testing.expect(std.mem.indexOf(u8, resp, "prompt=1") != null);
-    // Should contain mode and content_hash fields
-    try std.testing.expect(std.mem.indexOf(u8, resp, "|mode=unknown|") != null);
+    // Should contain mode=cooked (mock buffer ends with "$ " → prompt detected)
+    try std.testing.expect(std.mem.indexOf(u8, resp, "|mode=cooked|") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "|content_hash=") != null);
     // content_hash should be 8 hex chars before the trailing newline
     const hash_start = std.mem.indexOf(u8, resp, "content_hash=").? + "content_hash=".len;
