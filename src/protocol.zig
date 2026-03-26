@@ -296,6 +296,49 @@ test "parse PASTE with base64 decode" {
     }
 }
 
+test "parse INPUT with CJK base64 decode" {
+    // CJK text: "あいうえお" (U+3042..U+304A) is 15 bytes in UTF-8
+    // base64 of "あいうえお" = "44GC44GE44GG44GI44GK"
+    var line = "INPUT|agent|44GC44GE44GG44GI44GK".*;
+    const req = try parse(&line);
+    switch (req) {
+        .input => |inp| {
+            try std.testing.expectEqualStrings("agent", inp.from);
+            try std.testing.expectEqualStrings("あいうえお", inp.payload);
+            try std.testing.expect(inp.tab == .none);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse INPUT with long CJK base64" {
+    // Test with a longer CJK string to verify no truncation
+    // "日本語テスト文字列" (9 chars, 27 bytes UTF-8)
+    // base64: "5pel5pys6Kqe44OG44K544OI5paH5a2X5YiX"
+    var line = "INPUT|agent|5pel5pys6Kqe44OG44K544OI5paH5a2X5YiX".*;
+    const req = try parse(&line);
+    switch (req) {
+        .input => |inp| {
+            try std.testing.expectEqualStrings("agent", inp.from);
+            try std.testing.expectEqualStrings("日本語テスト文字列", inp.payload);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse RAW_INPUT with CJK" {
+    // base64 of "漢字" = "5ryi5a2X"
+    var line = "RAW_INPUT|agent|5ryi5a2X".*;
+    const req = try parse(&line);
+    switch (req) {
+        .raw_input => |inp| {
+            try std.testing.expectEqualStrings("agent", inp.from);
+            try std.testing.expectEqualStrings("漢字", inp.payload);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "parse CLOSE_TAB with id" {
     const req = try parse("CLOSE_TAB|id=t_001");
     switch (req) {
