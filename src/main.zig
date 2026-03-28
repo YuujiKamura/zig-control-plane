@@ -8,15 +8,50 @@ pub const utils = @import("utils.zig");
 
 pub const pipe_server = @import("pipe_server.zig");
 
+const log = std.log.scoped(.control_plane);
+
+/// Combined snapshot of tab state, captured in a single UI-thread round-trip.
+/// All buffers are stack-allocated; no heap allocation required.
+pub const CombinedSnapshot = struct {
+    tab_count: usize = 0,
+    active_tab: usize = 0,
+    pwd: [4096]u8 = undefined,
+    pwd_len: usize = 0,
+    has_selection: bool = false,
+    viewport: [65536]u8 = undefined,
+    viewport_len: usize = 0,
+    title: [256]u8 = undefined,
+    title_len: usize = 0,
+
+    /// Clamp all length fields to their respective buffer sizes.
+    /// Call after receiving snapshot data from an external provider to
+    /// prevent out-of-bounds slicing even if the provider writes bad lengths.
+    pub fn sanitize(self: *CombinedSnapshot) void {
+        if (self.viewport_len > self.viewport.len) {
+            log.warn("snapshot viewport_len {} exceeds buffer {}, clamping", .{ self.viewport_len, self.viewport.len });
+            self.viewport_len = self.viewport.len;
+        }
+        if (self.pwd_len > self.pwd.len) {
+            log.warn("snapshot pwd_len {} exceeds buffer {}, clamping", .{ self.pwd_len, self.pwd.len });
+            self.pwd_len = self.pwd.len;
+        }
+        if (self.title_len > self.title.len) {
+            log.warn("snapshot title_len {} exceeds buffer {}, clamping", .{ self.title_len, self.title.len });
+            self.title_len = self.title.len;
+        }
+        if (self.active_tab >= self.tab_count and self.tab_count > 0) {
+            log.warn("snapshot active_tab {} >= tab_count {}, clamping to 0", .{ self.active_tab, self.tab_count });
+            self.active_tab = 0;
+        }
+    }
+};
+
 pub const Provider = struct {
     ctx: *anyopaque,
-    readBuffer: *const fn (ctx: *anyopaque, tab_index: ?usize, buf: []u8) usize,
+    /// Capture all tab state in one UI-thread call (Issue #142).
+    /// This is the sole data-read path for STATE, TAIL, and LIST_TABS.
+    captureSnapshot: *const fn (ctx: *anyopaque, tab_index: usize, result: *CombinedSnapshot) bool,
     sendInput: *const fn (ctx: *anyopaque, text: []const u8, raw: bool, tab_index: ?usize) void,
-    tabCount: *const fn (ctx: *anyopaque) usize,
-    activeTab: *const fn (ctx: *anyopaque) usize,
-    tabTitle: *const fn (ctx: *anyopaque, index: usize, buf: []u8) usize,
-    tabWorkingDir: *const fn (ctx: *anyopaque, index: usize, buf: []u8) usize,
-    tabHasSelection: *const fn (ctx: *anyopaque, index: usize) bool,
     newTab: *const fn (ctx: *anyopaque) void,
     closeTab: *const fn (ctx: *anyopaque, index: usize) void,
     switchTab: *const fn (ctx: *anyopaque, index: usize) void,
@@ -54,9 +89,11 @@ pub const ControlPlane = struct {
         var tab_mgr = tab_id.TabIdManager.init(allocator);
         errdefer tab_mgr.deinit();
 
-        // Initial tab sync
-        const count = provider.tabCount(provider.ctx);
-        try tab_mgr.syncTabs(count);
+        // Initial tab sync via snapshot (tab_index=0 is safe; we only need tab_count)
+        var snap: CombinedSnapshot = .{};
+        _ = provider.captureSnapshot(provider.ctx, 0, &snap);
+        snap.sanitize();
+        try tab_mgr.syncTabs(snap.tab_count);
 
         const owned_name = try allocator.dupe(u8, session_name);
 
@@ -73,11 +110,9 @@ pub const ControlPlane = struct {
     pub fn start(self: *ControlPlane) !void {
         const hwnd_val = self.provider.hwnd(self.provider.ctx);
         try self.sess_mgr.writeFile(hwnd_val);
-        // pipe_server.start() will be added when Task 4 is merged
     }
 
     pub fn stop(self: *ControlPlane) void {
-        // pipe_server.stop() will be added when Task 4 is merged
         self.sess_mgr.removeFile();
     }
 
@@ -97,18 +132,33 @@ pub const ControlPlane = struct {
         };
     }
 
-    /// Resolve tab, falling back to active tab if target is .none.
-    fn resolveTabOrActive(self: *ControlPlane, target: protocol.TabTarget) usize {
-        return self.resolveTab(target) orelse self.provider.activeTab(self.provider.ctx);
+    /// Resolve tab, falling back to active tab via snapshot.
+    /// Returns null if tab_count is 0 (no tabs available).
+    fn resolveTabOrActive(self: *ControlPlane, target: protocol.TabTarget) ?usize {
+        if (self.resolveTab(target)) |idx| return idx;
+        var snap: CombinedSnapshot = .{};
+        _ = self.provider.captureSnapshot(self.provider.ctx, 0, &snap);
+        snap.sanitize();
+        if (snap.tab_count == 0) return null;
+        return snap.active_tab;
     }
 
-    /// Core request dispatch — called by pipe server handler.
+    /// Core request dispatch -- called by pipe server handler.
+    /// Never panics. Returns an ERROR response on OOM or internal errors.
     pub fn handleRequest(self: *ControlPlane, request_line: []const u8) ![]u8 {
+        return self.handleRequestInner(request_line) catch |err| {
+            log.err("handleRequest failed: {}", .{err});
+            return protocol.formatError(self.allocator, self.session_name, "INTERNAL_ERROR");
+        };
+    }
+
+    fn handleRequestInner(self: *ControlPlane, request_line: []const u8) ![]u8 {
         const alloc = self.allocator;
         const ctx = self.provider.ctx;
         const p = self.provider;
 
         const request = protocol.parse(request_line) catch {
+            log.warn("failed to parse request: {s}", .{request_line});
             return try protocol.formatError(alloc, self.session_name, "PARSE_ERROR");
         };
 
@@ -117,27 +167,23 @@ pub const ControlPlane = struct {
                 return try protocol.formatPong(alloc, self.session_name, self.pid, p.hwnd(ctx));
             },
             .state => |tab_target| {
-                const tab_index = self.resolveTabOrActive(tab_target);
-                var buf: [64 * 1024]u8 = undefined;
-                const buf_len = p.readBuffer(ctx, tab_index, &buf);
-                const buffer = buf[0..buf_len];
+                const tab_index = self.resolveTabOrActive(tab_target) orelse {
+                    log.warn("STATE: no tabs available", .{});
+                    return try protocol.formatError(alloc, self.session_name, "NO_TABS");
+                };
 
-                var title_buf: [256]u8 = undefined;
-                const title_len = p.tabTitle(ctx, tab_index, &title_buf);
-                const title = title_buf[0..title_len];
+                var snap: CombinedSnapshot = .{};
+                if (!p.captureSnapshot(ctx, tab_index, &snap)) {
+                    log.warn("STATE: captureSnapshot returned false for tab {}", .{tab_index});
+                    return try protocol.formatError(alloc, self.session_name, "SNAPSHOT_FAILED");
+                }
+                snap.sanitize();
 
-                var pwd_buf: [1024]u8 = undefined;
-                const pwd_len = p.tabWorkingDir(ctx, tab_index, &pwd_buf);
-                const pwd = pwd_buf[0..pwd_len];
-
-                const has_selection = p.tabHasSelection(ctx, tab_index);
+                const buffer = snap.viewport[0..snap.viewport_len];
+                const title = snap.title[0..snap.title_len];
+                const pwd = snap.pwd[0..snap.pwd_len];
                 const prompt = utils.inferPrompt(buffer, pwd);
-                const tab_count = p.tabCount(ctx);
-                const active = p.activeTab(ctx);
-
                 const tab_id_str = self.tab_mgr.getId(tab_index) orelse "?";
-
-                // Compute content hash (FNV-1a 32-bit) of visible buffer
                 const content_hash = std.hash.Fnv1a_32.hash(buffer);
 
                 const base = try protocol.formatState(
@@ -147,38 +193,38 @@ pub const ControlPlane = struct {
                     p.hwnd(ctx),
                     title,
                     prompt,
-                    has_selection,
+                    snap.has_selection,
                     pwd,
-                    tab_count,
-                    active,
+                    snap.tab_count,
+                    snap.active_tab,
                     tab_id_str,
                 );
                 defer alloc.free(base);
 
-                // Heuristic terminal mode detection (Issue #13):
-                // If inferPrompt detects a shell prompt, the terminal is likely in
-                // cooked/canonical mode (normal shell). Otherwise, a TUI app is
-                // probably running in raw mode (e.g., vim, Claude Code).
                 const mode_str = if (prompt) "cooked" else "raw";
-
-                // Append mode and content_hash fields.
-                // base ends with "\n", strip it, append new fields, re-add "\n".
                 const trimmed = std.mem.trimRight(u8, base, "\n");
                 return try std.fmt.allocPrint(alloc, "{s}|mode={s}|content_hash={x:0>8}\n", .{ trimmed, mode_str, content_hash });
             },
             .tail => |t| {
-                const tab_index = self.resolveTabOrActive(t.tab);
-                var buf: [64 * 1024]u8 = undefined;
-                const buf_len = p.readBuffer(ctx, tab_index, &buf);
-                const buffer = buf[0..buf_len];
+                const tab_index = self.resolveTabOrActive(t.tab) orelse {
+                    log.warn("TAIL: no tabs available", .{});
+                    return try protocol.formatError(alloc, self.session_name, "NO_TABS");
+                };
+
+                var snap: CombinedSnapshot = .{};
+                if (!p.captureSnapshot(ctx, tab_index, &snap)) {
+                    log.warn("TAIL: captureSnapshot returned false for tab {}", .{tab_index});
+                    return try protocol.formatError(alloc, self.session_name, "SNAPSHOT_FAILED");
+                }
+                snap.sanitize();
+
+                const buffer = snap.viewport[0..snap.viewport_len];
                 const lines = utils.sliceLastLines(buffer, t.lines);
 
-                // Count actual line count in the result
                 var line_count: usize = 0;
                 for (lines) |c| {
                     if (c == '\n') line_count += 1;
                 }
-                // If there's content without a trailing newline, that's also a line
                 if (lines.len > 0 and lines[lines.len - 1] != '\n') {
                     line_count += 1;
                 }
@@ -186,9 +232,13 @@ pub const ControlPlane = struct {
                 return try protocol.formatTail(alloc, self.session_name, line_count, lines);
             },
             .list_tabs => {
-                const tab_count = p.tabCount(ctx);
+                var meta_snap: CombinedSnapshot = .{};
+                _ = p.captureSnapshot(ctx, 0, &meta_snap);
+                meta_snap.sanitize();
+                const tab_count = meta_snap.tab_count;
+                const active = meta_snap.active_tab;
+
                 try self.tab_mgr.syncTabs(tab_count);
-                const active = p.activeTab(ctx);
 
                 var result = std.ArrayListUnmanaged(u8){};
                 errdefer result.deinit(alloc);
@@ -199,23 +249,19 @@ pub const ControlPlane = struct {
 
                 var i: usize = 0;
                 while (i < tab_count) : (i += 1) {
-                    var title_buf: [256]u8 = undefined;
-                    const title_len = p.tabTitle(ctx, i, &title_buf);
-                    const title = title_buf[0..title_len];
+                    var tab_snap: CombinedSnapshot = .{};
+                    _ = p.captureSnapshot(ctx, i, &tab_snap);
+                    tab_snap.sanitize();
 
-                    var pwd_buf: [1024]u8 = undefined;
-                    const pwd_len = p.tabWorkingDir(ctx, i, &pwd_buf);
-                    const pwd = pwd_buf[0..pwd_len];
-
-                    const has_selection = p.tabHasSelection(ctx, i);
+                    const title = tab_snap.title[0..tab_snap.title_len];
+                    const pwd = tab_snap.pwd[0..tab_snap.pwd_len];
+                    const has_selection = tab_snap.has_selection;
                     const tab_id_str = self.tab_mgr.getId(i) orelse "?";
 
-                    // Infer prompt for the active tab
                     var prompt = false;
                     if (i == active) {
-                        var buf: [64 * 1024]u8 = undefined;
-                        const buf_len = p.readBuffer(ctx, i, &buf);
-                        prompt = utils.inferPrompt(buf[0..buf_len], pwd);
+                        const viewport = tab_snap.viewport[0..tab_snap.viewport_len];
+                        prompt = utils.inferPrompt(viewport, pwd);
                     }
 
                     const line = try protocol.formatTabLine(alloc, i, tab_id_str, title, pwd, prompt, has_selection);
@@ -228,18 +274,15 @@ pub const ControlPlane = struct {
             .input => |inp| {
                 const tab_index = self.resolveTab(inp.tab);
                 p.sendInput(ctx, inp.payload, false, tab_index);
-                // sendInput uses PostMessageW (fire-and-forget), so delivery is not confirmed.
                 return try std.fmt.allocPrint(alloc, "QUEUED|{s}|INPUT\n", .{self.session_name});
             },
             .raw_input => |inp| {
                 const tab_index = self.resolveTab(inp.tab);
                 p.sendInput(ctx, inp.payload, true, tab_index);
-                // sendInput uses PostMessageW (fire-and-forget), so delivery is not confirmed.
                 return try std.fmt.allocPrint(alloc, "QUEUED|{s}|RAW_INPUT\n", .{self.session_name});
             },
             .paste => |inp| {
                 const tab_index = self.resolveTab(inp.tab);
-                // Wrap payload in bracketed paste mode: ESC[200~ + payload + ESC[201~ + CR
                 const prefix = "\x1b[200~";
                 const suffix = "\x1b[201~";
                 var buf: [64 * 1024]u8 = undefined;
@@ -253,18 +296,22 @@ pub const ControlPlane = struct {
             },
             .new_tab => {
                 p.newTab(ctx);
-                // newTab posts asynchronously (PostMessageW) so tabCount is stale here.
-                // Return acknowledgement without claiming a specific tab ID.
                 return try std.fmt.allocPrint(alloc, "OK|{s}|NEW_TAB\n", .{self.session_name});
             },
             .close_tab => |tab_target| {
-                const tab_index = self.resolveTabOrActive(tab_target);
+                const tab_index = self.resolveTabOrActive(tab_target) orelse {
+                    log.warn("CLOSE_TAB: no tabs available", .{});
+                    return try protocol.formatError(alloc, self.session_name, "NO_TABS");
+                };
                 self.tab_mgr.removeTabAtIndex(tab_index);
                 p.closeTab(ctx, tab_index);
                 return try std.fmt.allocPrint(alloc, "ACK|{s}|CLOSE_TAB|{d}\n", .{ self.session_name, tab_index });
             },
             .switch_tab => |tab_target| {
-                const tab_index = self.resolveTabOrActive(tab_target);
+                const tab_index = self.resolveTabOrActive(tab_target) orelse {
+                    log.warn("SWITCH_TAB: no tabs available", .{});
+                    return try protocol.formatError(alloc, self.session_name, "NO_TABS");
+                };
                 p.switchTab(ctx, tab_index);
                 return try std.fmt.allocPrint(alloc, "ACK|{s}|SWITCH_TAB|{d}\n", .{ self.session_name, tab_index });
             },
@@ -279,9 +326,6 @@ pub const ControlPlane = struct {
                 return try protocol.formatError(alloc, self.session_name, "deprecated");
             },
             .subscribe, .unsubscribe => {
-                // SUBSCRIBE/UNSUBSCRIBE are handled at the pipe_server level
-                // (intercepted before reaching handleRequest). If we get here,
-                // the client sent them outside a PERSIST connection.
                 return try protocol.formatError(alloc, self.session_name, "subscribe_requires_persist");
             },
         }
@@ -324,17 +368,10 @@ const MockState = struct {
     close_tab_called: ?usize = null,
     switch_tab_called: ?usize = null,
     focus_called: bool = false,
+    snapshot_fail: bool = false,
 };
 
 var mock_state = MockState{};
-
-fn mockReadBuffer(_: *anyopaque, _: ?usize, buf: []u8) usize {
-    const src = mock_state.buffer;
-    const len = @min(src.len, buf.len);
-    @memcpy(buf[0..len], src[0..len]);
-    return len;
-}
-
 var mock_input_buf: [64 * 1024]u8 = undefined;
 
 fn mockSendInput(_: *anyopaque, text: []const u8, raw: bool, _: ?usize) void {
@@ -343,30 +380,28 @@ fn mockSendInput(_: *anyopaque, text: []const u8, raw: bool, _: ?usize) void {
     mock_state.last_input_raw = raw;
 }
 
-fn mockTabCount(_: *anyopaque) usize {
-    return mock_state.tab_count;
-}
+fn mockCaptureSnapshot(_: *anyopaque, _: usize, result: *CombinedSnapshot) bool {
+    if (mock_state.snapshot_fail) return false;
 
-fn mockActiveTab(_: *anyopaque) usize {
-    return mock_state.active_tab;
-}
+    const src_buf = mock_state.buffer;
+    const buf_len = @min(src_buf.len, result.viewport.len);
+    @memcpy(result.viewport[0..buf_len], src_buf[0..buf_len]);
+    result.viewport_len = buf_len;
 
-fn mockTabTitle(_: *anyopaque, _: usize, buf: []u8) usize {
-    const src = mock_state.title;
-    const len = @min(src.len, buf.len);
-    @memcpy(buf[0..len], src[0..len]);
-    return len;
-}
+    const src_title = mock_state.title;
+    const title_len = @min(src_title.len, result.title.len);
+    @memcpy(result.title[0..title_len], src_title[0..title_len]);
+    result.title_len = title_len;
 
-fn mockTabWorkingDir(_: *anyopaque, _: usize, buf: []u8) usize {
-    const src = mock_state.pwd;
-    const len = @min(src.len, buf.len);
-    @memcpy(buf[0..len], src[0..len]);
-    return len;
-}
+    const src_pwd = mock_state.pwd;
+    const pwd_len = @min(src_pwd.len, result.pwd.len);
+    @memcpy(result.pwd[0..pwd_len], src_pwd[0..pwd_len]);
+    result.pwd_len = pwd_len;
 
-fn mockTabHasSelection(_: *anyopaque, _: usize) bool {
-    return mock_state.has_selection;
+    result.has_selection = mock_state.has_selection;
+    result.tab_count = mock_state.tab_count;
+    result.active_tab = mock_state.active_tab;
+    return true;
 }
 
 fn mockNewTab(_: *anyopaque) void {
@@ -393,13 +428,8 @@ fn mockHwnd(_: *anyopaque) usize {
 
 var mock_provider_storage = Provider{
     .ctx = undefined,
-    .readBuffer = &mockReadBuffer,
+    .captureSnapshot = &mockCaptureSnapshot,
     .sendInput = &mockSendInput,
-    .tabCount = &mockTabCount,
-    .activeTab = &mockActiveTab,
-    .tabTitle = &mockTabTitle,
-    .tabWorkingDir = &mockTabWorkingDir,
-    .tabHasSelection = &mockTabHasSelection,
     .newTab = &mockNewTab,
     .closeTab = &mockCloseTab,
     .switchTab = &mockSwitchTab,
@@ -408,7 +438,6 @@ var mock_provider_storage = Provider{
 };
 
 fn getMockProvider() *const Provider {
-    // ctx can be anything since mock functions use the global mock_state
     mock_state = MockState{};
     var dummy: u8 = 0;
     mock_provider_storage.ctx = @ptrCast(&dummy);
@@ -417,13 +446,11 @@ fn getMockProvider() *const Provider {
 
 fn initTestCp() !ControlPlane {
     const prov = getMockProvider();
-    // Bypass session manager by constructing directly
     var tab_mgr = tab_id.TabIdManager.init(std.testing.allocator);
     try tab_mgr.syncTabs(mock_state.tab_count);
 
     const owned_name = try std.testing.allocator.dupe(u8, "test-session");
 
-    // Create a minimal SessionManager for testing
     var tmp_dir = std.testing.tmpDir(.{});
     const tmp_path = try tmp_dir.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_path);
@@ -463,15 +490,31 @@ test "handleRequest STATE" {
     const resp = try cp.handleRequest("STATE");
     defer std.testing.allocator.free(resp);
     try std.testing.expect(std.mem.startsWith(u8, resp, "STATE|test-session|"));
-    // Should contain prompt=1 since mock buffer ends with "$ "
     try std.testing.expect(std.mem.indexOf(u8, resp, "prompt=1") != null);
-    // Should contain mode=cooked (mock buffer ends with "$ " → prompt detected)
     try std.testing.expect(std.mem.indexOf(u8, resp, "|mode=cooked|") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "|content_hash=") != null);
-    // content_hash should be 8 hex chars before the trailing newline
     const hash_start = std.mem.indexOf(u8, resp, "content_hash=").? + "content_hash=".len;
     const hash_end = std.mem.indexOfPos(u8, resp, hash_start, "\n") orelse resp.len;
     try std.testing.expectEqual(@as(usize, 8), hash_end - hash_start);
+}
+
+test "handleRequest STATE snapshot_fail returns SNAPSHOT_FAILED" {
+    var cp = try initTestCp();
+    defer cp.deinit();
+    mock_state.snapshot_fail = true;
+    // Use explicit tab index to bypass resolveTabOrActive (which also calls captureSnapshot)
+    const resp = try cp.handleRequest("STATE|0");
+    defer std.testing.allocator.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "SNAPSHOT_FAILED") != null);
+}
+
+test "handleRequest STATE zero tabs returns NO_TABS" {
+    var cp = try initTestCp();
+    defer cp.deinit();
+    mock_state.tab_count = 0;
+    const resp = try cp.handleRequest("STATE");
+    defer std.testing.allocator.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "NO_TABS") != null);
 }
 
 test "handleRequest TAIL" {
@@ -482,13 +525,22 @@ test "handleRequest TAIL" {
     try std.testing.expect(std.mem.startsWith(u8, resp, "TAIL|test-session|"));
 }
 
+test "handleRequest TAIL snapshot_fail returns SNAPSHOT_FAILED" {
+    var cp = try initTestCp();
+    defer cp.deinit();
+    mock_state.snapshot_fail = true;
+    // Use explicit tab index to bypass resolveTabOrActive
+    const resp = try cp.handleRequest("TAIL|5|0");
+    defer std.testing.allocator.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "SNAPSHOT_FAILED") != null);
+}
+
 test "handleRequest LIST_TABS" {
     var cp = try initTestCp();
     defer cp.deinit();
     const resp = try cp.handleRequest("LIST_TABS");
     defer std.testing.allocator.free(resp);
     try std.testing.expect(std.mem.startsWith(u8, resp, "LIST_TABS|2|0"));
-    // Should contain TAB lines
     try std.testing.expect(std.mem.indexOf(u8, resp, "TAB|0|") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "TAB|1|") != null);
 }
@@ -529,15 +581,23 @@ test "handleRequest CLOSE_TAB" {
     try std.testing.expectEqual(@as(?usize, 0), mock_state.close_tab_called);
 }
 
+test "handleRequest CLOSE_TAB zero tabs returns NO_TABS" {
+    var cp = try initTestCp();
+    defer cp.deinit();
+    mock_state.tab_count = 0;
+    // Use id=nonexistent so resolveTab returns null, then snapshot shows tab_count=0 -> NO_TABS
+    const resp = try cp.handleRequest("CLOSE_TAB|id=nonexistent");
+    defer std.testing.allocator.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "NO_TABS") != null);
+}
+
 test "handleRequest PASTE" {
     var cp = try initTestCp();
     defer cp.deinit();
-    // "aGVsbG8=" is base64 for "hello"
     var line = "PASTE|agent|aGVsbG8=".*;
     const resp = try cp.handleRequest(&line);
     defer std.testing.allocator.free(resp);
     try std.testing.expectEqualStrings("QUEUED|test-session|PASTE\n", resp);
-    // Verify the payload was wrapped in bracketed paste mode
     const expected = "\x1b[200~hello\x1b[201~";
     try std.testing.expectEqualStrings(expected, mock_state.last_input.?);
     try std.testing.expect(mock_state.last_input_raw);
@@ -561,4 +621,32 @@ test "handleRequest unknown command" {
     const resp = try cp.handleRequest("FOOBAR");
     defer std.testing.allocator.free(resp);
     try std.testing.expect(std.mem.indexOf(u8, resp, "PARSE_ERROR") != null);
+}
+
+test "CombinedSnapshot sanitize clamps overflow" {
+    var snap: CombinedSnapshot = .{};
+    snap.viewport_len = 999999;
+    snap.pwd_len = 99999;
+    snap.title_len = 99999;
+    snap.tab_count = 3;
+    snap.active_tab = 5;
+    snap.sanitize();
+    try std.testing.expectEqual(snap.viewport.len, snap.viewport_len);
+    try std.testing.expectEqual(snap.pwd.len, snap.pwd_len);
+    try std.testing.expectEqual(snap.title.len, snap.title_len);
+    try std.testing.expectEqual(@as(usize, 0), snap.active_tab);
+}
+
+test "CombinedSnapshot sanitize no-op when valid" {
+    var snap: CombinedSnapshot = .{};
+    snap.viewport_len = 100;
+    snap.pwd_len = 10;
+    snap.title_len = 5;
+    snap.tab_count = 2;
+    snap.active_tab = 1;
+    snap.sanitize();
+    try std.testing.expectEqual(@as(usize, 100), snap.viewport_len);
+    try std.testing.expectEqual(@as(usize, 10), snap.pwd_len);
+    try std.testing.expectEqual(@as(usize, 5), snap.title_len);
+    try std.testing.expectEqual(@as(usize, 1), snap.active_tab);
 }
