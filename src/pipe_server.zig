@@ -42,6 +42,13 @@ const SDDL_STRING = std.unicode.utf8ToUtf16LeStringLiteral("D:(A;;GA;;;OW)");
 
 pub const HandlerFn = *const fn (request: []const u8, ctx: *anyopaque, allocator: Allocator) []const u8;
 
+/// A subscriber is a persistent pipe connection that receives push events.
+pub const Subscriber = struct {
+    pipe: HANDLE,
+    status: bool, // subscribed to STATUS events
+    output: bool, // subscribed to OUTPUT events
+};
+
 pub const PipeServer = struct {
     pipe_path_w: [:0]const u16,
     stop_flag: std.atomic.Value(bool),
@@ -50,6 +57,8 @@ pub const PipeServer = struct {
     ctx: *anyopaque,
     allocator: Allocator,
     active_clients: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    subscribers_lock: std.Thread.Mutex = .{},
+    subscribers: std.ArrayListUnmanaged(Subscriber) = .{},
 
     pub fn init(allocator: Allocator, pipe_name: []const u8, handler: HandlerFn, ctx: *anyopaque) !PipeServer {
         const pipe_path_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, pipe_name);
@@ -80,6 +89,7 @@ pub const PipeServer = struct {
 
     pub fn deinit(self: *PipeServer) void {
         self.stop();
+        self.subscribers.deinit(self.allocator);
         self.allocator.free(self.pipe_path_w);
         self.* = undefined;
     }
@@ -203,6 +213,8 @@ pub const PipeServer = struct {
     fn handleClient(self: *PipeServer, pipe: HANDLE) void {
         const event = w.CreateEventExW(null, null, CREATE_EVENT_MANUAL_RESET, EVENT_ALL_ACCESS) catch return;
         defer w.CloseHandle(event);
+        // On disconnect, remove this pipe from subscriber list.
+        defer self.removeSubscriber(pipe);
 
         var buf: [65536]u8 = undefined;
         var carry: [65536]u8 = undefined;
@@ -229,7 +241,39 @@ pub const PipeServer = struct {
                 continue;
             }
 
-            // 3) Dispatch to handler
+            // 3) Check for SUBSCRIBE/UNSUBSCRIBE (requires PERSIST mode)
+            if (std.mem.startsWith(u8, request, "SUBSCRIBE|")) {
+                if (!persistent) {
+                    writeAll(pipe, "ERR|subscribe_requires_persist\n");
+                    break;
+                }
+                const topic = request["SUBSCRIBE|".len..];
+                if (std.mem.eql(u8, topic, "status")) {
+                    self.addSubscription(pipe, .status);
+                    writeAll(pipe, "OK|SUBSCRIBED|status\n");
+                } else if (std.mem.eql(u8, topic, "output")) {
+                    self.addSubscription(pipe, .output);
+                    writeAll(pipe, "OK|SUBSCRIBED|output\n");
+                } else {
+                    writeAll(pipe, "ERR|unknown_topic\n");
+                }
+                continue;
+            }
+            if (std.mem.startsWith(u8, request, "UNSUBSCRIBE|")) {
+                const topic = request["UNSUBSCRIBE|".len..];
+                if (std.mem.eql(u8, topic, "status")) {
+                    self.removeSubscription(pipe, .status);
+                    writeAll(pipe, "OK|UNSUBSCRIBED|status\n");
+                } else if (std.mem.eql(u8, topic, "output")) {
+                    self.removeSubscription(pipe, .output);
+                    writeAll(pipe, "OK|UNSUBSCRIBED|output\n");
+                } else {
+                    writeAll(pipe, "ERR|unknown_topic\n");
+                }
+                continue;
+            }
+
+            // 4) Dispatch to handler
             const response = self.handler(request, self.ctx, self.allocator);
             defer self.allocator.free(response);
             writeAll(pipe, response);
@@ -303,6 +347,90 @@ pub const PipeServer = struct {
             carry_len.* = new_total;
 
             // Loop back to try extractLine again
+        }
+    }
+
+    // ── Subscription management ──
+
+    const SubscriptionTopic = enum { status, output };
+
+    fn addSubscription(self: *PipeServer, pipe: HANDLE, topic: SubscriptionTopic) void {
+        self.subscribers_lock.lock();
+        defer self.subscribers_lock.unlock();
+        // Find existing subscriber for this pipe handle.
+        for (self.subscribers.items) |*sub| {
+            if (sub.pipe == pipe) {
+                switch (topic) {
+                    .status => sub.status = true,
+                    .output => sub.output = true,
+                }
+                return;
+            }
+        }
+        // New subscriber.
+        var sub = Subscriber{ .pipe = pipe, .status = false, .output = false };
+        switch (topic) {
+            .status => sub.status = true,
+            .output => sub.output = true,
+        }
+        self.subscribers.append(self.allocator, sub) catch {};
+    }
+
+    fn removeSubscription(self: *PipeServer, pipe: HANDLE, topic: SubscriptionTopic) void {
+        self.subscribers_lock.lock();
+        defer self.subscribers_lock.unlock();
+        for (self.subscribers.items) |*sub| {
+            if (sub.pipe == pipe) {
+                switch (topic) {
+                    .status => sub.status = false,
+                    .output => sub.output = false,
+                }
+                // Remove if no subscriptions left.
+                if (!sub.status and !sub.output) {
+                    const idx = (@intFromPtr(sub) - @intFromPtr(self.subscribers.items.ptr)) / @sizeOf(Subscriber);
+                    _ = self.subscribers.swapRemove(idx);
+                }
+                return;
+            }
+        }
+    }
+
+    fn removeSubscriber(self: *PipeServer, pipe: HANDLE) void {
+        self.subscribers_lock.lock();
+        defer self.subscribers_lock.unlock();
+        var i: usize = 0;
+        while (i < self.subscribers.items.len) {
+            if (self.subscribers.items[i].pipe == pipe) {
+                _ = self.subscribers.swapRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Push an event line to all subscribers that match the topic.
+    /// Called from any thread. Thread-safe via subscribers_lock.
+    pub fn pushEvent(self: *PipeServer, topic: SubscriptionTopic, event_line: []const u8) void {
+        self.subscribers_lock.lock();
+        defer self.subscribers_lock.unlock();
+        var i: usize = 0;
+        while (i < self.subscribers.items.len) {
+            const sub = &self.subscribers.items[i];
+            const interested = switch (topic) {
+                .status => sub.status,
+                .output => sub.output,
+            };
+            if (interested) {
+                // WriteFile may fail if client disconnected — remove on failure.
+                var written: DWORD = 0;
+                const ok = k32.WriteFile(sub.pipe, event_line.ptr, @intCast(event_line.len), &written, null);
+                if (ok == 0) {
+                    _ = self.subscribers.swapRemove(i);
+                    continue;
+                }
+                _ = k32.FlushFileBuffers(sub.pipe);
+            }
+            i += 1;
         }
     }
 

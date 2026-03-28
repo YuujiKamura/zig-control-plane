@@ -17,6 +17,25 @@ pub const TabTarget = union(enum) {
     }
 };
 
+/// Topics that can be subscribed to for push notifications.
+pub const SubscribeTopic = enum {
+    status,
+    output,
+
+    pub fn parse(field: []const u8) ?SubscribeTopic {
+        if (std.mem.eql(u8, field, "status")) return .status;
+        if (std.mem.eql(u8, field, "output")) return .output;
+        return null;
+    }
+
+    pub fn name(self: SubscribeTopic) []const u8 {
+        return switch (self) {
+            .status => "status",
+            .output => "output",
+        };
+    }
+};
+
 pub const Request = union(enum) {
     ping,
     state: TabTarget,
@@ -32,6 +51,8 @@ pub const Request = union(enum) {
     msg: []const u8,
     agent_status,
     set_agent: struct { tab: TabTarget, agent_type: []const u8 },
+    subscribe: SubscribeTopic,
+    unsubscribe: SubscribeTopic,
 };
 
 pub const ParseError = error{
@@ -118,6 +139,18 @@ pub fn parse(line: []const u8) ParseError!Request {
         const tab_field = it.next() orelse return ParseError.MissingField;
         const agent_type = it.next() orelse return ParseError.MissingField;
         return .{ .set_agent = .{ .tab = TabTarget.parse(tab_field), .agent_type = agent_type } };
+    }
+
+    if (std.mem.eql(u8, cmd, "SUBSCRIBE")) {
+        const topic_str = it.next() orelse return ParseError.MissingField;
+        const topic = SubscribeTopic.parse(topic_str) orelse return ParseError.UnknownCommand;
+        return .{ .subscribe = topic };
+    }
+
+    if (std.mem.eql(u8, cmd, "UNSUBSCRIBE")) {
+        const topic_str = it.next() orelse return ParseError.MissingField;
+        const topic = SubscribeTopic.parse(topic_str) orelse return ParseError.UnknownCommand;
+        return .{ .unsubscribe = topic };
     }
 
     return ParseError.UnknownCommand;
@@ -399,4 +432,43 @@ test "formatTabLine" {
     const result = try formatTabLine(std.testing.allocator, 0, "t_001", "bash", "/home", true, false);
     defer std.testing.allocator.free(result);
     try std.testing.expectEqualStrings("TAB|0|t_001|bash|pwd=/home|prompt=1|selection=0\n", result);
+}
+
+test "parse SUBSCRIBE status" {
+    const req = try parse("SUBSCRIBE|status");
+    switch (req) {
+        .subscribe => |topic| try std.testing.expectEqual(SubscribeTopic.status, topic),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse SUBSCRIBE output" {
+    const req = try parse("SUBSCRIBE|output");
+    switch (req) {
+        .subscribe => |topic| try std.testing.expectEqual(SubscribeTopic.output, topic),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse UNSUBSCRIBE status" {
+    const req = try parse("UNSUBSCRIBE|status");
+    switch (req) {
+        .unsubscribe => |topic| try std.testing.expectEqual(SubscribeTopic.status, topic),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse SUBSCRIBE unknown topic" {
+    const result = parse("SUBSCRIBE|unknown");
+    try std.testing.expectError(ParseError.UnknownCommand, result);
+}
+
+test "parse SUBSCRIBE missing topic" {
+    const result = parse("SUBSCRIBE");
+    try std.testing.expectError(ParseError.MissingField, result);
+}
+
+test "SubscribeTopic.name" {
+    try std.testing.expectEqualStrings("status", SubscribeTopic.status.name());
+    try std.testing.expectEqualStrings("output", SubscribeTopic.output.name());
 }

@@ -278,6 +278,12 @@ pub const ControlPlane = struct {
             .agent_status, .set_agent => {
                 return try protocol.formatError(alloc, self.session_name, "deprecated");
             },
+            .subscribe, .unsubscribe => {
+                // SUBSCRIBE/UNSUBSCRIBE are handled at the pipe_server level
+                // (intercepted before reaching handleRequest). If we get here,
+                // the client sent them outside a PERSIST connection.
+                return try protocol.formatError(alloc, self.session_name, "subscribe_requires_persist");
+            },
         }
     }
 };
