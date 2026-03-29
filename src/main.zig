@@ -325,8 +325,11 @@ pub const ControlPlane = struct {
             .agent_status, .set_agent => {
                 return try protocol.formatError(alloc, self.session_name, "deprecated");
             },
-            .subscribe, .unsubscribe => {
-                return try protocol.formatError(alloc, self.session_name, "subscribe_requires_persist");
+            .subscribe => {
+                return try std.fmt.allocPrint(alloc, "SUBSCRIBE_OK|status\n", .{});
+            },
+            .unsubscribe => {
+                return try std.fmt.allocPrint(alloc, "UNSUBSCRIBE_OK\n", .{});
             },
         }
     }
