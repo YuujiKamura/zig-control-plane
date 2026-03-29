@@ -51,6 +51,8 @@ pub const Provider = struct {
     /// Capture all tab state in one UI-thread call (Issue #142).
     /// This is the sole data-read path for STATE, TAIL, and LIST_TABS.
     captureSnapshot: *const fn (ctx: *anyopaque, tab_index: usize, result: *CombinedSnapshot) bool,
+    /// Optional: capture full scrollback history. If null, falls back to captureSnapshot.
+    captureHistory: ?*const fn (ctx: *anyopaque, tab_index: usize, result: *CombinedSnapshot) bool = null,
     sendInput: *const fn (ctx: *anyopaque, text: []const u8, raw: bool, tab_index: ?usize) void,
     newTab: *const fn (ctx: *anyopaque) void,
     closeTab: *const fn (ctx: *anyopaque, index: usize) void,
@@ -230,6 +232,37 @@ pub const ControlPlane = struct {
                 }
 
                 return try protocol.formatTail(alloc, self.session_name, line_count, lines);
+            },
+            .history => |h| {
+                const tab_index = self.resolveTabOrActive(h.tab) orelse {
+                    log.warn("HISTORY: no tabs available", .{});
+                    return try protocol.formatError(alloc, self.session_name, "NO_TABS");
+                };
+
+                var snap: CombinedSnapshot = .{};
+                const captured = if (p.captureHistory) |captureHistoryFn|
+                    captureHistoryFn(ctx, tab_index, &snap)
+                else
+                    p.captureSnapshot(ctx, tab_index, &snap);
+
+                if (!captured) {
+                    log.warn("HISTORY: capture returned false for tab {}", .{tab_index});
+                    return try protocol.formatError(alloc, self.session_name, "SNAPSHOT_FAILED");
+                }
+                snap.sanitize();
+
+                const buffer = snap.viewport[0..snap.viewport_len];
+                const lines = if (h.lines > 0) utils.sliceLastLines(buffer, h.lines) else buffer;
+
+                var line_count: usize = 0;
+                for (lines) |c| {
+                    if (c == '\n') line_count += 1;
+                }
+                if (lines.len > 0 and lines[lines.len - 1] != '\n') {
+                    line_count += 1;
+                }
+
+                return try protocol.formatHistory(alloc, self.session_name, line_count, lines);
             },
             .list_tabs => {
                 var meta_snap: CombinedSnapshot = .{};
@@ -616,6 +649,40 @@ test "handleRequest deprecated commands" {
     const resp2 = try cp.handleRequest("SET_AGENT|0|claude");
     defer std.testing.allocator.free(resp2);
     try std.testing.expect(std.mem.indexOf(u8, resp2, "deprecated") != null);
+}
+
+test "handleRequest HISTORY falls back to captureSnapshot" {
+    var cp = try initTestCp();
+    defer cp.deinit();
+    const resp = try cp.handleRequest("HISTORY");
+    defer std.testing.allocator.free(resp);
+    try std.testing.expect(std.mem.startsWith(u8, resp, "HISTORY|test-session|"));
+}
+
+test "handleRequest HISTORY with lines" {
+    var cp = try initTestCp();
+    defer cp.deinit();
+    const resp = try cp.handleRequest("HISTORY|5");
+    defer std.testing.allocator.free(resp);
+    try std.testing.expect(std.mem.startsWith(u8, resp, "HISTORY|test-session|"));
+}
+
+test "handleRequest HISTORY snapshot_fail returns SNAPSHOT_FAILED" {
+    var cp = try initTestCp();
+    defer cp.deinit();
+    mock_state.snapshot_fail = true;
+    const resp = try cp.handleRequest("HISTORY|0|0");
+    defer std.testing.allocator.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "SNAPSHOT_FAILED") != null);
+}
+
+test "handleRequest HISTORY zero tabs returns NO_TABS" {
+    var cp = try initTestCp();
+    defer cp.deinit();
+    mock_state.tab_count = 0;
+    const resp = try cp.handleRequest("HISTORY");
+    defer std.testing.allocator.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "NO_TABS") != null);
 }
 
 test "handleRequest unknown command" {

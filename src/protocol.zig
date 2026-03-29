@@ -40,6 +40,7 @@ pub const Request = union(enum) {
     ping,
     state: TabTarget,
     tail: struct { lines: usize = 20, tab: TabTarget = .none },
+    history: struct { lines: usize = 0, tab: TabTarget = .none },
     list_tabs,
     input: struct { from: []const u8, payload: []const u8, tab: TabTarget = .none },
     raw_input: struct { from: []const u8, payload: []const u8, tab: TabTarget = .none },
@@ -96,6 +97,17 @@ pub fn parse(line: []const u8) ParseError!Request {
             return .{ .tail = .{ .lines = lines, .tab = TabTarget.parse(tab_field) } };
         } else |_| {
             return .{ .tail = .{ .lines = 20, .tab = TabTarget.parse(first) } };
+        }
+    }
+
+    if (std.mem.eql(u8, cmd, "HISTORY")) {
+        const first = it.next() orelse return .{ .history = .{ .lines = 0, .tab = .none } };
+        // first field could be lines count or tab target
+        if (std.fmt.parseInt(usize, first, 10)) |lines| {
+            const tab_field = it.next() orelse return .{ .history = .{ .lines = lines, .tab = .none } };
+            return .{ .history = .{ .lines = lines, .tab = TabTarget.parse(tab_field) } };
+        } else |_| {
+            return .{ .history = .{ .lines = 0, .tab = TabTarget.parse(first) } };
         }
     }
 
@@ -185,6 +197,10 @@ pub fn formatError(alloc: Allocator, session_name: []const u8, code: []const u8)
 
 pub fn formatTail(alloc: Allocator, session_name: []const u8, lines_count: usize, buffer: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "TAIL|{s}|{d}\n{s}", .{ session_name, lines_count, buffer });
+}
+
+pub fn formatHistory(alloc: Allocator, session_name: []const u8, lines_count: usize, buffer: []const u8) ![]u8 {
+    return std.fmt.allocPrint(alloc, "HISTORY|{s}|{d}\n{s}", .{ session_name, lines_count, buffer });
 }
 
 pub fn formatListTabsHeader(alloc: Allocator, tab_count: usize, active_tab: usize) ![]u8 {
@@ -466,6 +482,56 @@ test "parse SUBSCRIBE unknown topic" {
 test "parse SUBSCRIBE missing topic" {
     const result = parse("SUBSCRIBE");
     try std.testing.expectError(ParseError.MissingField, result);
+}
+
+test "parse HISTORY default" {
+    const req = try parse("HISTORY");
+    switch (req) {
+        .history => |h| {
+            try std.testing.expectEqual(@as(usize, 0), h.lines);
+            try std.testing.expect(h.tab == .none);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse HISTORY with lines" {
+    const req = try parse("HISTORY|100");
+    switch (req) {
+        .history => |h| {
+            try std.testing.expectEqual(@as(usize, 100), h.lines);
+            try std.testing.expect(h.tab == .none);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse HISTORY with lines and tab" {
+    const req = try parse("HISTORY|50|id=t_001");
+    switch (req) {
+        .history => |h| {
+            try std.testing.expectEqual(@as(usize, 50), h.lines);
+            switch (h.tab) {
+                .id => |id| try std.testing.expectEqualStrings("t_001", id),
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse HISTORY with tab only" {
+    const req = try parse("HISTORY|id=t_002");
+    switch (req) {
+        .history => |h| {
+            try std.testing.expectEqual(@as(usize, 0), h.lines);
+            switch (h.tab) {
+                .id => |id| try std.testing.expectEqualStrings("t_002", id),
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "SubscribeTopic.name" {
