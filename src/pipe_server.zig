@@ -3,6 +3,8 @@ const Allocator = std.mem.Allocator;
 const w = std.os.windows;
 const k32 = w.kernel32;
 
+const log = std.log.scoped(.pipe_server);
+
 const HANDLE = w.HANDLE;
 const DWORD = w.DWORD;
 const BOOL = w.BOOL;
@@ -130,6 +132,7 @@ pub const PipeServer = struct {
     };
 
     fn commandServerIteration(self: *PipeServer, sa: *SECURITY_ATTRIBUTES) void {
+        log.debug("commandServerIteration: creating pipe...", .{});
         const pipe = k32.CreateNamedPipeW(
             self.pipe_path_w,
             PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
@@ -140,7 +143,12 @@ pub const PipeServer = struct {
             0,
             sa,
         );
-        if (pipe == INVALID_HANDLE_VALUE) return;
+        if (pipe == INVALID_HANDLE_VALUE) {
+            const err = k32.GetLastError();
+            log.err("CreateNamedPipeW FAILED err={d}", .{@intFromEnum(err)});
+            return;
+        }
+        log.debug("commandServerIteration: pipe created, waiting for client...", .{});
 
         // Create manual-reset event for overlapped I/O
         const event = w.CreateEventExW(null, null, CREATE_EVENT_MANUAL_RESET, EVENT_ALL_ACCESS) catch {
@@ -208,7 +216,11 @@ pub const PipeServer = struct {
         const self = ctx.server;
         const pipe = ctx.pipe;
         self.allocator.destroy(ctx);
-        defer _ = self.active_clients.fetchSub(1, .acq_rel);
+        log.debug("clientThread: started", .{});
+        defer {
+            log.debug("clientThread: exiting", .{});
+            _ = self.active_clients.fetchSub(1, .acq_rel);
+        }
         defer {
             _ = DisconnectNamedPipe(pipe);
             w.CloseHandle(pipe);
@@ -217,6 +229,7 @@ pub const PipeServer = struct {
     }
 
     fn handleClient(self: *PipeServer, pipe: HANDLE) void {
+        log.debug("handleClient: enter", .{});
         const event = w.CreateEventExW(null, null, CREATE_EVENT_MANUAL_RESET, EVENT_ALL_ACCESS) catch return;
         defer w.CloseHandle(event);
 
@@ -227,10 +240,12 @@ pub const PipeServer = struct {
 
         while (!self.stop_flag.load(.monotonic)) {
             // 1) Try to get a complete request line
+            log.debug("handleClient: reading request...", .{});
             const request = self.readRequestLine(pipe, event, &buf, &carry, &carry_len, persistent) orelse {
-                // null means disconnect, timeout (1-shot), or fatal error
+                log.debug("handleClient: readRequestLine returned null (disconnect/timeout)", .{});
                 return;
             };
+            log.debug("handleClient: got request len={d}", .{request.len});
             // Empty line: in persistent mode keep the connection alive, in 1-shot mode we're done.
             if (request.len == 0) {
                 if (persistent) continue;
@@ -263,11 +278,21 @@ pub const PipeServer = struct {
             }
 
             // 4) Dispatch to handler
+            log.debug("handleClient: dispatching to handler...", .{});
             const response = self.handler(request, self.ctx, self.allocator);
             defer self.allocator.free(response);
-            writeAll(pipe, response) catch return;
+            log.debug("handleClient: handler returned {d} bytes, writing response...", .{response.len});
+            writeAll(pipe, response) catch |err| {
+                log.err("handleClient: writeAll failed: {}", .{err});
+                return;
+            };
+            log.debug("handleClient: response written OK", .{});
 
-            if (!persistent) break; // legacy 1-shot mode
+            if (!persistent) {
+                // Flush so the client can read before we disconnect.
+                _ = k32.FlushFileBuffers(pipe);
+                break;
+            }
         }
     }
 
