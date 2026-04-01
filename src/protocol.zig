@@ -54,6 +54,7 @@ pub const Request = union(enum) {
     set_agent: struct { tab: TabTarget, agent_type: []const u8 },
     subscribe: SubscribeTopic,
     unsubscribe: SubscribeTopic,
+    ack_poll: u32, // cmd_id to check
 };
 
 pub const ParseError = error{
@@ -163,6 +164,12 @@ pub fn parse(line: []const u8) ParseError!Request {
         const topic_str = it.next() orelse return ParseError.MissingField;
         const topic = SubscribeTopic.parse(topic_str) orelse return ParseError.UnknownCommand;
         return .{ .unsubscribe = topic };
+    }
+
+    if (std.mem.eql(u8, cmd, "ACK_POLL")) {
+        const id_str = it.next() orelse return ParseError.MissingField;
+        const cmd_id = std.fmt.parseInt(u32, id_str, 10) catch return ParseError.MissingField;
+        return .{ .ack_poll = cmd_id };
     }
 
     return ParseError.UnknownCommand;

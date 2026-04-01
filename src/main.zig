@@ -55,6 +55,8 @@ pub const Provider = struct {
     captureHistory: ?*const fn (ctx: *anyopaque, tab_index: usize, result: *CombinedSnapshot) bool = null,
     /// Returns cmd_id for ACK tracking. 0 means no ACK needed.
     sendInput: *const fn (ctx: *anyopaque, text: []const u8, raw: bool, tab_index: ?usize) u32,
+    /// Check if cmd_id has been drained (processed by UI thread). Returns true if ACKed.
+    ackPoll: ?*const fn (ctx: *anyopaque, cmd_id: u32) bool = null,
     newTab: *const fn (ctx: *anyopaque) void,
     closeTab: *const fn (ctx: *anyopaque, index: usize) void,
     switchTab: *const fn (ctx: *anyopaque, index: usize) void,
@@ -364,6 +366,18 @@ pub const ControlPlane = struct {
             },
             .unsubscribe => {
                 return try std.fmt.allocPrint(alloc, "UNSUBSCRIBE_OK\n", .{});
+            },
+            .ack_poll => |cmd_id| {
+                if (p.ackPoll) |poll_fn| {
+                    const acked = poll_fn(ctx, cmd_id);
+                    if (acked) {
+                        return try std.fmt.allocPrint(alloc, "ACK|{s}|{d}\n", .{ self.session_name, cmd_id });
+                    } else {
+                        return try std.fmt.allocPrint(alloc, "NACK|{s}|{d}\n", .{ self.session_name, cmd_id });
+                    }
+                } else {
+                    return try protocol.formatError(alloc, self.session_name, "ACK_POLL not supported");
+                }
             },
         }
     }
