@@ -53,7 +53,8 @@ pub const Provider = struct {
     captureSnapshot: *const fn (ctx: *anyopaque, tab_index: usize, result: *CombinedSnapshot) bool,
     /// Optional: capture full scrollback history. If null, falls back to captureSnapshot.
     captureHistory: ?*const fn (ctx: *anyopaque, tab_index: usize, result: *CombinedSnapshot) bool = null,
-    sendInput: *const fn (ctx: *anyopaque, text: []const u8, raw: bool, tab_index: ?usize) void,
+    /// Returns cmd_id for ACK tracking. 0 means no ACK needed.
+    sendInput: *const fn (ctx: *anyopaque, text: []const u8, raw: bool, tab_index: ?usize) u32,
     newTab: *const fn (ctx: *anyopaque) void,
     closeTab: *const fn (ctx: *anyopaque, index: usize) void,
     switchTab: *const fn (ctx: *anyopaque, index: usize) void,
@@ -306,13 +307,13 @@ pub const ControlPlane = struct {
             },
             .input => |inp| {
                 const tab_index = self.resolveTab(inp.tab);
-                p.sendInput(ctx, inp.payload, false, tab_index);
-                return try std.fmt.allocPrint(alloc, "QUEUED|{s}|INPUT\n", .{self.session_name});
+                const cmd_id = p.sendInput(ctx, inp.payload, false, tab_index);
+                return try std.fmt.allocPrint(alloc, "QUEUED|{s}|INPUT|{d}\n", .{ self.session_name, cmd_id });
             },
             .raw_input => |inp| {
                 const tab_index = self.resolveTab(inp.tab);
-                p.sendInput(ctx, inp.payload, true, tab_index);
-                return try std.fmt.allocPrint(alloc, "QUEUED|{s}|RAW_INPUT\n", .{self.session_name});
+                const cmd_id = p.sendInput(ctx, inp.payload, true, tab_index);
+                return try std.fmt.allocPrint(alloc, "QUEUED|{s}|RAW_INPUT|{d}\n", .{ self.session_name, cmd_id });
             },
             .paste => |inp| {
                 const tab_index = self.resolveTab(inp.tab);
@@ -324,8 +325,8 @@ pub const ControlPlane = struct {
                 @memcpy(buf[0..prefix.len], prefix);
                 @memcpy(buf[prefix.len..][0..inp.payload.len], inp.payload);
                 @memcpy(buf[prefix.len + inp.payload.len ..][0..suffix.len], suffix);
-                p.sendInput(ctx, buf[0..total], true, tab_index);
-                return try std.fmt.allocPrint(alloc, "QUEUED|{s}|PASTE\n", .{self.session_name});
+                const cmd_id = p.sendInput(ctx, buf[0..total], true, tab_index);
+                return try std.fmt.allocPrint(alloc, "QUEUED|{s}|PASTE|{d}\n", .{ self.session_name, cmd_id });
             },
             .new_tab => {
                 p.newTab(ctx);
@@ -410,10 +411,11 @@ const MockState = struct {
 var mock_state = MockState{};
 var mock_input_buf: [64 * 1024]u8 = undefined;
 
-fn mockSendInput(_: *anyopaque, text: []const u8, raw: bool, _: ?usize) void {
+fn mockSendInput(_: *anyopaque, text: []const u8, raw: bool, _: ?usize) u32 {
     @memcpy(mock_input_buf[0..text.len], text);
     mock_state.last_input = mock_input_buf[0..text.len];
     mock_state.last_input_raw = raw;
+    return 1; // mock cmd_id
 }
 
 fn mockCaptureSnapshot(_: *anyopaque, _: usize, result: *CombinedSnapshot) bool {
@@ -633,7 +635,7 @@ test "handleRequest PASTE" {
     var line = "PASTE|agent|aGVsbG8=".*;
     const resp = try cp.handleRequest(&line);
     defer std.testing.allocator.free(resp);
-    try std.testing.expectEqualStrings("QUEUED|test-session|PASTE\n", resp);
+    try std.testing.expectEqualStrings("QUEUED|test-session|PASTE|1\n", resp);
     const expected = "\x1b[200~hello\x1b[201~";
     try std.testing.expectEqualStrings(expected, mock_state.last_input.?);
     try std.testing.expect(mock_state.last_input_raw);
