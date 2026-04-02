@@ -10,6 +10,38 @@ pub const pipe_server = @import("pipe_server.zig");
 
 const log = std.log.scoped(.control_plane);
 
+fn appendKeyToken(buf: *std.ArrayListUnmanaged(u8), alloc: Allocator, token: []const u8) !void {
+    const t = std.mem.trim(u8, token, " \t\r\n");
+    if (t.len == 0) return;
+
+    if (std.ascii.eqlIgnoreCase(t, "Ctrl+C")) {
+        try buf.append(alloc, 0x03);
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(t, "Tab")) {
+        try buf.append(alloc, '\t');
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(t, "Up")) {
+        try buf.appendSlice(alloc, "\x1b[A");
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(t, "Down")) {
+        try buf.appendSlice(alloc, "\x1b[B");
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(t, "Enter")) {
+        try buf.append(alloc, '\r');
+        return;
+    }
+    if (std.ascii.eqlIgnoreCase(t, "Esc")) {
+        try buf.append(alloc, 0x1b);
+        return;
+    }
+
+    return error.InvalidKeyToken;
+}
+
 /// Combined snapshot of tab state, captured in a single UI-thread round-trip.
 /// All buffers are stack-allocated; no heap allocation required.
 pub const CombinedSnapshot = struct {
@@ -359,6 +391,24 @@ pub const ControlPlane = struct {
                 const cmd_id = p.sendInput(ctx, buf[0..total], true, tab_index);
                 return try std.fmt.allocPrint(alloc, "QUEUED|{s}|PASTE|{d}\n", .{ self.session_name, cmd_id });
             },
+            .send_keys => |s| {
+                const tab_index = self.resolveTab(s.tab);
+                var payload = std.ArrayListUnmanaged(u8){};
+                defer payload.deinit(alloc);
+
+                var it = std.mem.splitScalar(u8, s.keys, ',');
+                while (it.next()) |tok| {
+                    appendKeyToken(&payload, alloc, tok) catch {
+                        return try protocol.formatError(alloc, self.session_name, "INVALID_KEY");
+                    };
+                }
+                if (payload.items.len == 0) {
+                    return try protocol.formatError(alloc, self.session_name, "INVALID_KEY");
+                }
+
+                const cmd_id = p.sendInput(ctx, payload.items, true, tab_index);
+                return try std.fmt.allocPrint(alloc, "QUEUED|{s}|SEND_KEYS|{d}\n", .{ self.session_name, cmd_id });
+            },
             .new_tab => {
                 p.newTab(ctx);
                 return try std.fmt.allocPrint(alloc, "OK|{s}|NEW_TAB\n", .{self.session_name});
@@ -573,7 +623,7 @@ test "handleRequest CAPABILITIES" {
     try std.testing.expect(std.mem.startsWith(u8, resp, "OK|test-session|CAPABILITIES|"));
     try std.testing.expect(std.mem.indexOf(u8, resp, "transport=polling") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "reads=STATE,CAPTURE_PANE,TAIL,HISTORY,LIST_TABS") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "writes=INPUT,RAW_INPUT,PASTE,ACK_POLL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "writes=INPUT,RAW_INPUT,PASTE,SEND_KEYS,ACK_POLL") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "control=NEW_TAB,CLOSE_TAB,SWITCH_TAB,FOCUS") != null);
 }
 
@@ -704,6 +754,25 @@ test "handleRequest PASTE" {
     const expected = "\x1b[200~hello\x1b[201~";
     try std.testing.expectEqualStrings(expected, mock_state.last_input.?);
     try std.testing.expect(mock_state.last_input_raw);
+}
+
+test "handleRequest SEND_KEYS" {
+    var cp = try initTestCp();
+    defer cp.deinit();
+    const resp = try cp.handleRequest("SEND_KEYS|agent|Ctrl+C,Enter,Up");
+    defer std.testing.allocator.free(resp);
+    try std.testing.expectEqualStrings("QUEUED|test-session|SEND_KEYS|1\n", resp);
+    const expected = "\x03\r\x1b[A";
+    try std.testing.expectEqualStrings(expected, mock_state.last_input.?);
+    try std.testing.expect(mock_state.last_input_raw);
+}
+
+test "handleRequest SEND_KEYS invalid key returns error" {
+    var cp = try initTestCp();
+    defer cp.deinit();
+    const resp = try cp.handleRequest("SEND_KEYS|agent|INVALID_KEY");
+    defer std.testing.allocator.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "INVALID_KEY") != null);
 }
 
 test "handleRequest deprecated commands" {

@@ -47,6 +47,7 @@ pub const Request = union(enum) {
     input: struct { from: []const u8, payload: []const u8, tab: TabTarget = .none },
     raw_input: struct { from: []const u8, payload: []const u8, tab: TabTarget = .none },
     paste: struct { from: []const u8, payload: []const u8, tab: TabTarget = .none },
+    send_keys: struct { from: []const u8, keys: []const u8, tab: TabTarget = .none },
     new_tab,
     close_tab: TabTarget,
     switch_tab: TabTarget,
@@ -141,6 +142,14 @@ pub fn parse(line: []const u8) ParseError!Request {
         }
     }
 
+    if (std.mem.eql(u8, cmd, "SEND_KEYS")) {
+        const from = it.next() orelse return ParseError.MissingField;
+        const keys = it.next() orelse return ParseError.MissingField;
+        const tab_field = it.next();
+        const tab = if (tab_field) |f| TabTarget.parse(f) else TabTarget.none;
+        return .{ .send_keys = .{ .from = from, .keys = keys, .tab = tab } };
+    }
+
     if (std.mem.eql(u8, cmd, "CLOSE_TAB")) {
         const field = it.next() orelse return ParseError.MissingField;
         return .{ .close_tab = TabTarget.parse(field) };
@@ -209,7 +218,7 @@ pub fn formatAck(alloc: Allocator, session_name: []const u8, pid: u32) ![]u8 {
 pub fn formatCapabilities(alloc: Allocator, session_name: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         alloc,
-        "OK|{s}|CAPABILITIES|transport=polling|reads=STATE,CAPTURE_PANE,TAIL,HISTORY,LIST_TABS|writes=INPUT,RAW_INPUT,PASTE,ACK_POLL|control=NEW_TAB,CLOSE_TAB,SWITCH_TAB,FOCUS\n",
+        "OK|{s}|CAPABILITIES|transport=polling|reads=STATE,CAPTURE_PANE,TAIL,HISTORY,LIST_TABS|writes=INPUT,RAW_INPUT,PASTE,SEND_KEYS,ACK_POLL|control=NEW_TAB,CLOSE_TAB,SWITCH_TAB,FOCUS\n",
         .{session_name},
     );
 }
@@ -438,6 +447,21 @@ test "parse RAW_INPUT with CJK" {
         .raw_input => |inp| {
             try std.testing.expectEqualStrings("agent", inp.from);
             try std.testing.expectEqualStrings("漢字", inp.payload);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse SEND_KEYS" {
+    const req = try parse("SEND_KEYS|agent|Ctrl+C,Enter|id=t_001");
+    switch (req) {
+        .send_keys => |v| {
+            try std.testing.expectEqualStrings("agent", v.from);
+            try std.testing.expectEqualStrings("Ctrl+C,Enter", v.keys);
+            switch (v.tab) {
+                .id => |id| try std.testing.expectEqualStrings("t_001", id),
+                else => return error.TestUnexpectedResult,
+            }
         },
         else => return error.TestUnexpectedResult,
     }
