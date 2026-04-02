@@ -43,6 +43,7 @@ pub const Request = union(enum) {
     capture_pane: TabTarget,
     tail: struct { lines: usize = 20, tab: TabTarget = .none },
     history: struct { lines: usize = 0, tab: TabTarget = .none },
+    wait_for: struct { timeout_ms: u32, pattern: []const u8, tab: TabTarget = .none },
     list_tabs,
     input: struct { from: []const u8, payload: []const u8, tab: TabTarget = .none },
     raw_input: struct { from: []const u8, payload: []const u8, tab: TabTarget = .none },
@@ -119,6 +120,15 @@ pub fn parse(line: []const u8) ParseError!Request {
         } else |_| {
             return .{ .history = .{ .lines = 0, .tab = TabTarget.parse(first) } };
         }
+    }
+
+    if (std.mem.eql(u8, cmd, "WAIT_FOR")) {
+        const timeout_str = it.next() orelse return ParseError.MissingField;
+        const timeout_ms = std.fmt.parseInt(u32, timeout_str, 10) catch return ParseError.MissingField;
+        const pattern = it.next() orelse return ParseError.MissingField;
+        const tab_field = it.next();
+        const tab = if (tab_field) |f| TabTarget.parse(f) else TabTarget.none;
+        return .{ .wait_for = .{ .timeout_ms = timeout_ms, .pattern = pattern, .tab = tab } };
     }
 
     if (std.mem.eql(u8, cmd, "INPUT") or std.mem.eql(u8, cmd, "RAW_INPUT") or std.mem.eql(u8, cmd, "PASTE")) {
@@ -218,7 +228,7 @@ pub fn formatAck(alloc: Allocator, session_name: []const u8, pid: u32) ![]u8 {
 pub fn formatCapabilities(alloc: Allocator, session_name: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         alloc,
-        "OK|{s}|CAPABILITIES|transport=polling|reads=STATE,CAPTURE_PANE,TAIL,HISTORY,LIST_TABS|writes=INPUT,RAW_INPUT,PASTE,SEND_KEYS,ACK_POLL|control=NEW_TAB,CLOSE_TAB,SWITCH_TAB,FOCUS\n",
+        "OK|{s}|CAPABILITIES|transport=polling|reads=STATE,CAPTURE_PANE,TAIL,HISTORY,WAIT_FOR,LIST_TABS|writes=INPUT,RAW_INPUT,PASTE,SEND_KEYS,ACK_POLL|control=NEW_TAB,CLOSE_TAB,SWITCH_TAB,FOCUS\n",
         .{session_name},
     );
 }
@@ -460,6 +470,21 @@ test "parse SEND_KEYS" {
             try std.testing.expectEqualStrings("Ctrl+C,Enter", v.keys);
             switch (v.tab) {
                 .id => |id| try std.testing.expectEqualStrings("t_001", id),
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse WAIT_FOR" {
+    const req = try parse("WAIT_FOR|1200|READY>|2");
+    switch (req) {
+        .wait_for => |w| {
+            try std.testing.expectEqual(@as(u32, 1200), w.timeout_ms);
+            try std.testing.expectEqualStrings("READY>", w.pattern);
+            switch (w.tab) {
+                .index => |idx| try std.testing.expectEqual(@as(usize, 2), idx),
                 else => return error.TestUnexpectedResult,
             }
         },

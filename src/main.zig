@@ -328,6 +328,38 @@ pub const ControlPlane = struct {
 
                 return try protocol.formatHistory(alloc, self.session_name, line_count, lines);
             },
+            .wait_for => |w| {
+                const tab_index = self.resolveTabOrActive(w.tab) orelse {
+                    log.warn("WAIT_FOR: no tabs available", .{});
+                    return try protocol.formatError(alloc, self.session_name, "NO_TABS");
+                };
+
+                const start_ms = std.time.milliTimestamp();
+                const deadline_ms = start_ms + @as(i64, @intCast(w.timeout_ms));
+
+                while (std.time.milliTimestamp() <= deadline_ms) {
+                    var snap: CombinedSnapshot = .{};
+                    if (!p.captureSnapshot(ctx, tab_index, &snap)) {
+                        log.warn("WAIT_FOR: captureSnapshot returned false for tab {}", .{tab_index});
+                        return try protocol.formatError(alloc, self.session_name, "SNAPSHOT_FAILED");
+                    }
+                    snap.sanitize();
+
+                    const buffer = snap.viewport[0..snap.viewport_len];
+                    if (std.mem.indexOf(u8, buffer, w.pattern) != null) {
+                        const elapsed = std.time.milliTimestamp() - start_ms;
+                        return try std.fmt.allocPrint(alloc, "OK|{s}|WAIT_FOR|matched=1|elapsed_ms={d}\n", .{
+                            self.session_name,
+                            elapsed,
+                        });
+                    }
+
+                    // Sleep on the pipe thread only. UI-thread callbacks remain short-lived.
+                    std.Thread.sleep(25 * std.time.ns_per_ms);
+                }
+
+                return try protocol.formatError(alloc, self.session_name, "TIMEOUT");
+            },
             .list_tabs => {
                 var meta_snap: CombinedSnapshot = .{};
                 _ = p.captureSnapshot(ctx, 0, &meta_snap);
@@ -622,7 +654,7 @@ test "handleRequest CAPABILITIES" {
     defer std.testing.allocator.free(resp);
     try std.testing.expect(std.mem.startsWith(u8, resp, "OK|test-session|CAPABILITIES|"));
     try std.testing.expect(std.mem.indexOf(u8, resp, "transport=polling") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "reads=STATE,CAPTURE_PANE,TAIL,HISTORY,LIST_TABS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "reads=STATE,CAPTURE_PANE,TAIL,HISTORY,WAIT_FOR,LIST_TABS") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "writes=INPUT,RAW_INPUT,PASTE,SEND_KEYS,ACK_POLL") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "control=NEW_TAB,CLOSE_TAB,SWITCH_TAB,FOCUS") != null);
 }
@@ -819,6 +851,22 @@ test "handleRequest HISTORY zero tabs returns NO_TABS" {
     const resp = try cp.handleRequest("HISTORY");
     defer std.testing.allocator.free(resp);
     try std.testing.expect(std.mem.indexOf(u8, resp, "NO_TABS") != null);
+}
+
+test "handleRequest WAIT_FOR matched" {
+    var cp = try initTestCp();
+    defer cp.deinit();
+    const resp = try cp.handleRequest("WAIT_FOR|200|host");
+    defer std.testing.allocator.free(resp);
+    try std.testing.expect(std.mem.startsWith(u8, resp, "OK|test-session|WAIT_FOR|matched=1|elapsed_ms="));
+}
+
+test "handleRequest WAIT_FOR timeout" {
+    var cp = try initTestCp();
+    defer cp.deinit();
+    const resp = try cp.handleRequest("WAIT_FOR|40|__never_match__");
+    defer std.testing.allocator.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "TIMEOUT") != null);
 }
 
 test "handleRequest unknown command" {
