@@ -54,6 +54,8 @@ pub const CombinedSnapshot = struct {
     viewport_len: usize = 0,
     title: [256]u8 = undefined,
     title_len: usize = 0,
+    cursor_row: i32 = -1,
+    cursor_col: i32 = -1,
 
     /// Clamp all length fields to their respective buffer sizes.
     /// Call after receiving snapshot data from an external provider to
@@ -360,6 +362,40 @@ pub const ControlPlane = struct {
 
                 return try protocol.formatError(alloc, self.session_name, "TIMEOUT");
             },
+            .cursor_pos => |tab_target| {
+                const tab_index = self.resolveTabOrActive(tab_target) orelse {
+                    log.warn("CURSOR_POS: no tabs available", .{});
+                    return try protocol.formatError(alloc, self.session_name, "NO_TABS");
+                };
+                var snap: CombinedSnapshot = .{};
+                if (!p.captureSnapshot(ctx, tab_index, &snap)) {
+                    log.warn("CURSOR_POS: captureSnapshot returned false for tab {}", .{tab_index});
+                    return try protocol.formatError(alloc, self.session_name, "SNAPSHOT_FAILED");
+                }
+                snap.sanitize();
+                if (snap.cursor_row < 0 or snap.cursor_col < 0) {
+                    return try protocol.formatError(alloc, self.session_name, "CURSOR_UNAVAILABLE");
+                }
+                return try std.fmt.allocPrint(alloc, "CURSOR_POS|{s}|{d}|{d}\n", .{
+                    self.session_name,
+                    snap.cursor_row,
+                    snap.cursor_col,
+                });
+            },
+            .pane_title => |tab_target| {
+                const tab_index = self.resolveTabOrActive(tab_target) orelse {
+                    log.warn("PANE_TITLE: no tabs available", .{});
+                    return try protocol.formatError(alloc, self.session_name, "NO_TABS");
+                };
+                var snap: CombinedSnapshot = .{};
+                if (!p.captureSnapshot(ctx, tab_index, &snap)) {
+                    log.warn("PANE_TITLE: captureSnapshot returned false for tab {}", .{tab_index});
+                    return try protocol.formatError(alloc, self.session_name, "SNAPSHOT_FAILED");
+                }
+                snap.sanitize();
+                const title = snap.title[0..snap.title_len];
+                return try std.fmt.allocPrint(alloc, "PANE_TITLE|{s}|{s}\n", .{ self.session_name, title });
+            },
             .list_tabs => {
                 var meta_snap: CombinedSnapshot = .{};
                 _ = p.captureSnapshot(ctx, 0, &meta_snap);
@@ -531,6 +567,8 @@ const MockState = struct {
     switch_tab_called: ?usize = null,
     focus_called: bool = false,
     snapshot_fail: bool = false,
+    cursor_row: i32 = 3,
+    cursor_col: i32 = 7,
 };
 
 var mock_state = MockState{};
@@ -564,6 +602,8 @@ fn mockCaptureSnapshot(_: *anyopaque, _: usize, result: *CombinedSnapshot) bool 
     result.has_selection = mock_state.has_selection;
     result.tab_count = mock_state.tab_count;
     result.active_tab = mock_state.active_tab;
+    result.cursor_row = mock_state.cursor_row;
+    result.cursor_col = mock_state.cursor_col;
     return true;
 }
 
@@ -654,7 +694,7 @@ test "handleRequest CAPABILITIES" {
     defer std.testing.allocator.free(resp);
     try std.testing.expect(std.mem.startsWith(u8, resp, "OK|test-session|CAPABILITIES|"));
     try std.testing.expect(std.mem.indexOf(u8, resp, "transport=polling") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "reads=STATE,CAPTURE_PANE,TAIL,HISTORY,WAIT_FOR,LIST_TABS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "reads=STATE,CAPTURE_PANE,TAIL,HISTORY,WAIT_FOR,CURSOR_POS,PANE_TITLE,LIST_TABS") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "writes=INPUT,RAW_INPUT,PASTE,SEND_KEYS,ACK_POLL") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "control=NEW_TAB,CLOSE_TAB,SWITCH_TAB,FOCUS") != null);
 }
@@ -867,6 +907,22 @@ test "handleRequest WAIT_FOR timeout" {
     const resp = try cp.handleRequest("WAIT_FOR|40|__never_match__");
     defer std.testing.allocator.free(resp);
     try std.testing.expect(std.mem.indexOf(u8, resp, "TIMEOUT") != null);
+}
+
+test "handleRequest CURSOR_POS" {
+    var cp = try initTestCp();
+    defer cp.deinit();
+    const resp = try cp.handleRequest("CURSOR_POS");
+    defer std.testing.allocator.free(resp);
+    try std.testing.expect(std.mem.startsWith(u8, resp, "CURSOR_POS|test-session|"));
+}
+
+test "handleRequest PANE_TITLE" {
+    var cp = try initTestCp();
+    defer cp.deinit();
+    const resp = try cp.handleRequest("PANE_TITLE");
+    defer std.testing.allocator.free(resp);
+    try std.testing.expectEqualStrings("PANE_TITLE|test-session|bash\n", resp);
 }
 
 test "handleRequest unknown command" {
