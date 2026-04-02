@@ -44,6 +44,7 @@ pub const Request = union(enum) {
     tail: struct { lines: usize = 20, tab: TabTarget = .none },
     history: struct { lines: usize = 0, tab: TabTarget = .none },
     wait_for: struct { timeout_ms: u32, pattern: []const u8, tab: TabTarget = .none },
+    pane_pid: TabTarget,
     cursor_pos: TabTarget,
     pane_title: TabTarget,
     list_tabs,
@@ -131,6 +132,11 @@ pub fn parse(line: []const u8) ParseError!Request {
         const tab_field = it.next();
         const tab = if (tab_field) |f| TabTarget.parse(f) else TabTarget.none;
         return .{ .wait_for = .{ .timeout_ms = timeout_ms, .pattern = pattern, .tab = tab } };
+    }
+
+    if (std.mem.eql(u8, cmd, "PANE_PID")) {
+        const field = it.next() orelse return .{ .pane_pid = .none };
+        return .{ .pane_pid = TabTarget.parse(field) };
     }
 
     if (std.mem.eql(u8, cmd, "CURSOR_POS")) {
@@ -240,7 +246,7 @@ pub fn formatAck(alloc: Allocator, session_name: []const u8, pid: u32) ![]u8 {
 pub fn formatCapabilities(alloc: Allocator, session_name: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         alloc,
-        "OK|{s}|CAPABILITIES|transport=polling|reads=STATE,CAPTURE_PANE,TAIL,HISTORY,WAIT_FOR,CURSOR_POS,PANE_TITLE,LIST_TABS|writes=INPUT,RAW_INPUT,PASTE,SEND_KEYS,ACK_POLL|control=NEW_TAB,CLOSE_TAB,SWITCH_TAB,FOCUS\n",
+        "OK|{s}|CAPABILITIES|transport=polling|reads=STATE,CAPTURE_PANE,TAIL,HISTORY,WAIT_FOR,PANE_PID,CURSOR_POS,PANE_TITLE,LIST_TABS|writes=INPUT,RAW_INPUT,PASTE,SEND_KEYS,ACK_POLL|control=NEW_TAB,CLOSE_TAB,SWITCH_TAB,FOCUS\n",
         .{session_name},
     );
 }
@@ -500,6 +506,14 @@ test "parse WAIT_FOR" {
                 else => return error.TestUnexpectedResult,
             }
         },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse PANE_PID with default tab" {
+    const req = try parse("PANE_PID");
+    switch (req) {
+        .pane_pid => |t| try std.testing.expect(t == .none),
         else => return error.TestUnexpectedResult,
     }
 }

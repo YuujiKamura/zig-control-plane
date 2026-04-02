@@ -54,6 +54,7 @@ pub const CombinedSnapshot = struct {
     viewport_len: usize = 0,
     title: [256]u8 = undefined,
     title_len: usize = 0,
+    pane_pid: u32 = 0,
     cursor_row: i32 = -1,
     cursor_col: i32 = -1,
 
@@ -362,6 +363,25 @@ pub const ControlPlane = struct {
 
                 return try protocol.formatError(alloc, self.session_name, "TIMEOUT");
             },
+            .pane_pid => |tab_target| {
+                const tab_index = self.resolveTabOrActive(tab_target) orelse {
+                    log.warn("PANE_PID: no tabs available", .{});
+                    return try protocol.formatError(alloc, self.session_name, "NO_TABS");
+                };
+                var snap: CombinedSnapshot = .{};
+                if (!p.captureSnapshot(ctx, tab_index, &snap)) {
+                    log.warn("PANE_PID: captureSnapshot returned false for tab {}", .{tab_index});
+                    return try protocol.formatError(alloc, self.session_name, "SNAPSHOT_FAILED");
+                }
+                snap.sanitize();
+                if (snap.pane_pid == 0) {
+                    return try protocol.formatError(alloc, self.session_name, "PANE_PID_UNAVAILABLE");
+                }
+                return try std.fmt.allocPrint(alloc, "PANE_PID|{s}|{d}\n", .{
+                    self.session_name,
+                    snap.pane_pid,
+                });
+            },
             .cursor_pos => |tab_target| {
                 const tab_index = self.resolveTabOrActive(tab_target) orelse {
                     log.warn("CURSOR_POS: no tabs available", .{});
@@ -567,6 +587,7 @@ const MockState = struct {
     switch_tab_called: ?usize = null,
     focus_called: bool = false,
     snapshot_fail: bool = false,
+    pane_pid: u32 = 4321,
     cursor_row: i32 = 3,
     cursor_col: i32 = 7,
 };
@@ -602,6 +623,7 @@ fn mockCaptureSnapshot(_: *anyopaque, _: usize, result: *CombinedSnapshot) bool 
     result.has_selection = mock_state.has_selection;
     result.tab_count = mock_state.tab_count;
     result.active_tab = mock_state.active_tab;
+    result.pane_pid = mock_state.pane_pid;
     result.cursor_row = mock_state.cursor_row;
     result.cursor_col = mock_state.cursor_col;
     return true;
@@ -694,7 +716,7 @@ test "handleRequest CAPABILITIES" {
     defer std.testing.allocator.free(resp);
     try std.testing.expect(std.mem.startsWith(u8, resp, "OK|test-session|CAPABILITIES|"));
     try std.testing.expect(std.mem.indexOf(u8, resp, "transport=polling") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "reads=STATE,CAPTURE_PANE,TAIL,HISTORY,WAIT_FOR,CURSOR_POS,PANE_TITLE,LIST_TABS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "reads=STATE,CAPTURE_PANE,TAIL,HISTORY,WAIT_FOR,PANE_PID,CURSOR_POS,PANE_TITLE,LIST_TABS") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "writes=INPUT,RAW_INPUT,PASTE,SEND_KEYS,ACK_POLL") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "control=NEW_TAB,CLOSE_TAB,SWITCH_TAB,FOCUS") != null);
 }
@@ -907,6 +929,14 @@ test "handleRequest WAIT_FOR timeout" {
     const resp = try cp.handleRequest("WAIT_FOR|40|__never_match__");
     defer std.testing.allocator.free(resp);
     try std.testing.expect(std.mem.indexOf(u8, resp, "TIMEOUT") != null);
+}
+
+test "handleRequest PANE_PID" {
+    var cp = try initTestCp();
+    defer cp.deinit();
+    const resp = try cp.handleRequest("PANE_PID");
+    defer std.testing.allocator.free(resp);
+    try std.testing.expectEqualStrings("PANE_PID|test-session|4321\n", resp);
 }
 
 test "handleRequest CURSOR_POS" {
