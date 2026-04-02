@@ -38,6 +38,7 @@ pub const SubscribeTopic = enum {
 
 pub const Request = union(enum) {
     ping,
+    capabilities,
     state: TabTarget,
     tail: struct { lines: usize = 20, tab: TabTarget = .none },
     history: struct { lines: usize = 0, tab: TabTarget = .none },
@@ -80,6 +81,7 @@ pub fn parse(line: []const u8) ParseError!Request {
     const cmd = it.first();
 
     if (std.mem.eql(u8, cmd, "PING")) return .ping;
+    if (std.mem.eql(u8, cmd, "CAPABILITIES")) return .capabilities;
     if (std.mem.eql(u8, cmd, "LIST_TABS")) return .list_tabs;
     if (std.mem.eql(u8, cmd, "NEW_TAB")) return .new_tab;
     if (std.mem.eql(u8, cmd, "FOCUS")) return .focus;
@@ -198,6 +200,14 @@ pub fn formatAck(alloc: Allocator, session_name: []const u8, pid: u32) ![]u8 {
     return std.fmt.allocPrint(alloc, "ACK|{s}|{d}\n", .{ session_name, pid });
 }
 
+pub fn formatCapabilities(alloc: Allocator, session_name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(
+        alloc,
+        "OK|{s}|CAPABILITIES|transport=polling|reads=STATE,TAIL,HISTORY,LIST_TABS|writes=INPUT,RAW_INPUT,PASTE,ACK_POLL|control=NEW_TAB,CLOSE_TAB,SWITCH_TAB,FOCUS\n",
+        .{session_name},
+    );
+}
+
 pub fn formatError(alloc: Allocator, session_name: []const u8, code: []const u8) ![]u8 {
     return std.fmt.allocPrint(alloc, "ERR|{s}|{s}\n", .{ session_name, code });
 }
@@ -265,6 +275,11 @@ pub fn formatState(
 test "parse PING" {
     const req = try parse("PING");
     try std.testing.expect(req == .ping);
+}
+
+test "parse CAPABILITIES" {
+    const req = try parse("CAPABILITIES");
+    try std.testing.expect(req == .capabilities);
 }
 
 test "parse STATE with id" {

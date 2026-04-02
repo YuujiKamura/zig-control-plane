@@ -171,6 +171,9 @@ pub const ControlPlane = struct {
             .ping => {
                 return try protocol.formatPong(alloc, self.session_name, self.pid, p.hwnd(ctx));
             },
+            .capabilities => {
+                return try protocol.formatCapabilities(alloc, self.session_name);
+            },
             .state => |tab_target| {
                 const tab_index = self.resolveTabOrActive(tab_target) orelse {
                     log.warn("STATE: no tabs available", .{});
@@ -534,6 +537,18 @@ test "handleRequest PING" {
     const resp = try cp.handleRequest("PING");
     defer std.testing.allocator.free(resp);
     try std.testing.expect(std.mem.startsWith(u8, resp, "PONG|test-session|"));
+}
+
+test "handleRequest CAPABILITIES" {
+    var cp = try initTestCp();
+    defer cp.deinit();
+    const resp = try cp.handleRequest("CAPABILITIES");
+    defer std.testing.allocator.free(resp);
+    try std.testing.expect(std.mem.startsWith(u8, resp, "OK|test-session|CAPABILITIES|"));
+    try std.testing.expect(std.mem.indexOf(u8, resp, "transport=polling") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "reads=STATE,TAIL,HISTORY,LIST_TABS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "writes=INPUT,RAW_INPUT,PASTE,ACK_POLL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "control=NEW_TAB,CLOSE_TAB,SWITCH_TAB,FOCUS") != null);
 }
 
 test "handleRequest STATE" {
