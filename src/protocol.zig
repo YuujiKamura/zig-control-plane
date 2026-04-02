@@ -40,6 +40,7 @@ pub const Request = union(enum) {
     ping,
     capabilities,
     state: TabTarget,
+    capture_pane: TabTarget,
     tail: struct { lines: usize = 20, tab: TabTarget = .none },
     history: struct { lines: usize = 0, tab: TabTarget = .none },
     list_tabs,
@@ -90,6 +91,11 @@ pub fn parse(line: []const u8) ParseError!Request {
     if (std.mem.eql(u8, cmd, "STATE")) {
         const field = it.next() orelse return .{ .state = .none };
         return .{ .state = TabTarget.parse(field) };
+    }
+
+    if (std.mem.eql(u8, cmd, "CAPTURE_PANE")) {
+        const field = it.next() orelse return .{ .capture_pane = .none };
+        return .{ .capture_pane = TabTarget.parse(field) };
     }
 
     if (std.mem.eql(u8, cmd, "TAIL")) {
@@ -203,8 +209,22 @@ pub fn formatAck(alloc: Allocator, session_name: []const u8, pid: u32) ![]u8 {
 pub fn formatCapabilities(alloc: Allocator, session_name: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         alloc,
-        "OK|{s}|CAPABILITIES|transport=polling|reads=STATE,TAIL,HISTORY,LIST_TABS|writes=INPUT,RAW_INPUT,PASTE,ACK_POLL|control=NEW_TAB,CLOSE_TAB,SWITCH_TAB,FOCUS\n",
+        "OK|{s}|CAPABILITIES|transport=polling|reads=STATE,CAPTURE_PANE,TAIL,HISTORY,LIST_TABS|writes=INPUT,RAW_INPUT,PASTE,ACK_POLL|control=NEW_TAB,CLOSE_TAB,SWITCH_TAB,FOCUS\n",
         .{session_name},
+    );
+}
+
+pub fn formatCapturePane(
+    alloc: Allocator,
+    session_name: []const u8,
+    epoch_ms: i64,
+    lines_count: usize,
+    buffer: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        alloc,
+        "OK|{s}|CAPTURE_PANE|epoch_ms={d}|lines={d}\n{s}",
+        .{ session_name, epoch_ms, lines_count, buffer },
     );
 }
 
@@ -301,6 +321,19 @@ test "parse STATE with index" {
         .state => |t| {
             switch (t) {
                 .index => |idx| try std.testing.expectEqual(@as(usize, 2), idx),
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse CAPTURE_PANE with id" {
+    const req = try parse("CAPTURE_PANE|id=t_001");
+    switch (req) {
+        .capture_pane => |t| {
+            switch (t) {
+                .id => |id| try std.testing.expectEqualStrings("t_001", id),
                 else => return error.TestUnexpectedResult,
             }
         },

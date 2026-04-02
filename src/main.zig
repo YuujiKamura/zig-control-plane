@@ -213,6 +213,32 @@ pub const ControlPlane = struct {
                 const trimmed = std.mem.trimRight(u8, base, "\n");
                 return try std.fmt.allocPrint(alloc, "{s}|mode={s}|content_hash={x:0>8}\n", .{ trimmed, mode_str, content_hash });
             },
+            .capture_pane => |tab_target| {
+                const tab_index = self.resolveTabOrActive(tab_target) orelse {
+                    log.warn("CAPTURE_PANE: no tabs available", .{});
+                    return try protocol.formatError(alloc, self.session_name, "NO_TABS");
+                };
+
+                var snap: CombinedSnapshot = .{};
+                if (!p.captureSnapshot(ctx, tab_index, &snap)) {
+                    log.warn("CAPTURE_PANE: captureSnapshot returned false for tab {}", .{tab_index});
+                    return try protocol.formatError(alloc, self.session_name, "SNAPSHOT_FAILED");
+                }
+                snap.sanitize();
+
+                const buffer = snap.viewport[0..snap.viewport_len];
+                const epoch_ms: i64 = std.time.milliTimestamp();
+
+                var line_count: usize = 0;
+                for (buffer) |c| {
+                    if (c == '\n') line_count += 1;
+                }
+                if (buffer.len > 0 and buffer[buffer.len - 1] != '\n') {
+                    line_count += 1;
+                }
+
+                return try protocol.formatCapturePane(alloc, self.session_name, epoch_ms, line_count, buffer);
+            },
             .tail => |t| {
                 const tab_index = self.resolveTabOrActive(t.tab) orelse {
                     log.warn("TAIL: no tabs available", .{});
@@ -546,9 +572,19 @@ test "handleRequest CAPABILITIES" {
     defer std.testing.allocator.free(resp);
     try std.testing.expect(std.mem.startsWith(u8, resp, "OK|test-session|CAPABILITIES|"));
     try std.testing.expect(std.mem.indexOf(u8, resp, "transport=polling") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "reads=STATE,TAIL,HISTORY,LIST_TABS") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "reads=STATE,CAPTURE_PANE,TAIL,HISTORY,LIST_TABS") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "writes=INPUT,RAW_INPUT,PASTE,ACK_POLL") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "control=NEW_TAB,CLOSE_TAB,SWITCH_TAB,FOCUS") != null);
+}
+
+test "handleRequest CAPTURE_PANE" {
+    var cp = try initTestCp();
+    defer cp.deinit();
+    const resp = try cp.handleRequest("CAPTURE_PANE");
+    defer std.testing.allocator.free(resp);
+    try std.testing.expect(std.mem.startsWith(u8, resp, "OK|test-session|CAPTURE_PANE|"));
+    try std.testing.expect(std.mem.indexOf(u8, resp, "epoch_ms=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "|lines=") != null);
 }
 
 test "handleRequest STATE" {
