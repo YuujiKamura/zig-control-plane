@@ -54,6 +54,7 @@ const CANCEL_DRAIN_TIMEOUT_MS: DWORD = 500;
 const ERROR_OPERATION_ABORTED = 995;
 const ERROR_BROKEN_PIPE = 109;
 const ERROR_NO_DATA = 232;
+const ERROR_PIPE_CONNECTED = 535;
 
 pub const PipeServer = struct {
     pipe_path_w: [:0]const u16,
@@ -160,7 +161,46 @@ pub const PipeServer = struct {
         var overlapped = std.mem.zeroes(OVERLAPPED);
         overlapped.hEvent = event;
 
-        _ = ConnectNamedPipe(pipe, &overlapped);
+        const connect_ok = ConnectNamedPipe(pipe, &overlapped);
+        var connected_immediately = false;
+        if (connect_ok != 0) {
+            connected_immediately = true;
+        } else {
+            const connect_err = @intFromEnum(k32.GetLastError());
+            if (connect_err == ERROR_PIPE_CONNECTED) {
+                // Client connected before ConnectNamedPipe completed.
+                connected_immediately = true;
+            } else if (connect_err != @intFromEnum(w.Win32Error.IO_PENDING)) {
+                log.err("ConnectNamedPipe FAILED err={d}", .{connect_err});
+                _ = DisconnectNamedPipe(pipe);
+                w.CloseHandle(pipe);
+                return;
+            }
+        }
+
+        if (connected_immediately) {
+            if (!self.stop_flag.load(.monotonic)) {
+                const ctx = self.allocator.create(ClientThreadCtx) catch {
+                    _ = DisconnectNamedPipe(pipe);
+                    w.CloseHandle(pipe);
+                    return;
+                };
+                ctx.* = .{ .server = self, .pipe = pipe };
+                _ = self.active_clients.fetchAdd(1, .acq_rel);
+                const t = std.Thread.spawn(.{}, clientThread, .{ctx}) catch {
+                    _ = self.active_clients.fetchSub(1, .acq_rel);
+                    self.allocator.destroy(ctx);
+                    _ = DisconnectNamedPipe(pipe);
+                    w.CloseHandle(pipe);
+                    return;
+                };
+                t.detach();
+            } else {
+                _ = DisconnectNamedPipe(pipe);
+                w.CloseHandle(pipe);
+            }
+            return;
+        }
 
         // Wait with 1s timeout for interruptibility
         while (!self.stop_flag.load(.monotonic)) {
