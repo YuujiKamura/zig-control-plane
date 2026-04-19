@@ -88,10 +88,13 @@ pub const Provider = struct {
     captureSnapshot: *const fn (ctx: *anyopaque, tab_index: usize, result: *CombinedSnapshot) bool,
     /// Optional: capture full scrollback history. If null, falls back to captureSnapshot.
     captureHistory: ?*const fn (ctx: *anyopaque, tab_index: usize, result: *CombinedSnapshot) bool = null,
-    /// Returns cmd_id for ACK tracking. 0 means no ACK needed.
+    /// Returns cmd_id for ACK tracking. 0 means the provider dropped the input
+    /// before enqueueing it (e.g. queue_full), so no ACK will ever arrive.
     sendInput: *const fn (ctx: *anyopaque, text: []const u8, raw: bool, tab_index: ?usize) u32,
     /// Check if cmd_id has been drained (processed by UI thread). Returns true if ACKed.
     ackPoll: ?*const fn (ctx: *anyopaque, cmd_id: u32) bool = null,
+    /// Optional fast-path for WAIT_DRAIN. When null, the control plane polls ackPoll().
+    waitDrain: ?*const fn (ctx: *anyopaque, cmd_id: u32, timeout_ms: u32) bool = null,
     newTab: *const fn (ctx: *anyopaque) void,
     closeTab: *const fn (ctx: *anyopaque, index: usize) void,
     switchTab: *const fn (ctx: *anyopaque, index: usize) void,
@@ -459,12 +462,12 @@ pub const ControlPlane = struct {
             .input => |inp| {
                 const tab_index = self.resolveTab(inp.tab);
                 const cmd_id = p.sendInput(ctx, inp.payload, false, tab_index);
-                return try std.fmt.allocPrint(alloc, "QUEUED|{s}|INPUT|{d}\n", .{ self.session_name, cmd_id });
+                return try formatQueuedWriteResponse(alloc, self.session_name, "INPUT", cmd_id);
             },
             .raw_input => |inp| {
                 const tab_index = self.resolveTab(inp.tab);
                 const cmd_id = p.sendInput(ctx, inp.payload, true, tab_index);
-                return try std.fmt.allocPrint(alloc, "QUEUED|{s}|RAW_INPUT|{d}\n", .{ self.session_name, cmd_id });
+                return try formatQueuedWriteResponse(alloc, self.session_name, "RAW_INPUT", cmd_id);
             },
             .paste => |inp| {
                 const tab_index = self.resolveTab(inp.tab);
@@ -477,7 +480,7 @@ pub const ControlPlane = struct {
                 @memcpy(buf[prefix.len..][0..inp.payload.len], inp.payload);
                 @memcpy(buf[prefix.len + inp.payload.len ..][0..suffix.len], suffix);
                 const cmd_id = p.sendInput(ctx, buf[0..total], true, tab_index);
-                return try std.fmt.allocPrint(alloc, "QUEUED|{s}|PASTE|{d}\n", .{ self.session_name, cmd_id });
+                return try formatQueuedWriteResponse(alloc, self.session_name, "PASTE", cmd_id);
             },
             .send_keys => |s| {
                 const tab_index = self.resolveTab(s.tab);
@@ -495,7 +498,7 @@ pub const ControlPlane = struct {
                 }
 
                 const cmd_id = p.sendInput(ctx, payload.items, true, tab_index);
-                return try std.fmt.allocPrint(alloc, "QUEUED|{s}|SEND_KEYS|{d}\n", .{ self.session_name, cmd_id });
+                return try formatQueuedWriteResponse(alloc, self.session_name, "SEND_KEYS", cmd_id);
             },
             .new_tab => {
                 p.newTab(ctx);
@@ -537,18 +540,41 @@ pub const ControlPlane = struct {
             .ack_poll => |cmd_id| {
                 if (p.ackPoll) |poll_fn| {
                     const acked = poll_fn(ctx, cmd_id);
-                    if (acked) {
-                        return try std.fmt.allocPrint(alloc, "ACK|{s}|{d}\n", .{ self.session_name, cmd_id });
-                    } else {
-                        return try std.fmt.allocPrint(alloc, "NACK|{s}|{d}\n", .{ self.session_name, cmd_id });
-                    }
+                    const state = if (acked) "drained" else "pending";
+                    return try std.fmt.allocPrint(alloc, "ACK_POLL|{d}|{s}\n", .{ cmd_id, state });
                 } else {
                     return try protocol.formatError(alloc, self.session_name, "ACK_POLL not supported");
                 }
             },
+            .wait_drain => |w| {
+                if (p.waitDrain) |wait_fn| {
+                    const drained = wait_fn(ctx, w.cmd_id, w.timeout_ms);
+                    const state = if (drained) "drained" else "timeout";
+                    return try std.fmt.allocPrint(alloc, "WAIT_DRAIN|{d}|{s}\n", .{ w.cmd_id, state });
+                }
+                if (p.ackPoll) |poll_fn| {
+                    const start_ms = std.time.milliTimestamp();
+                    const deadline_ms = start_ms + @as(i64, @intCast(w.timeout_ms));
+                    while (std.time.milliTimestamp() <= deadline_ms) {
+                        if (poll_fn(ctx, w.cmd_id)) {
+                            return try std.fmt.allocPrint(alloc, "WAIT_DRAIN|{d}|drained\n", .{w.cmd_id});
+                        }
+                        std.Thread.sleep(100 * std.time.ns_per_ms);
+                    }
+                    return try std.fmt.allocPrint(alloc, "WAIT_DRAIN|{d}|timeout\n", .{w.cmd_id});
+                }
+                return try protocol.formatError(alloc, self.session_name, "WAIT_DRAIN not supported");
+            },
         }
     }
 };
+
+fn formatQueuedWriteResponse(alloc: Allocator, session_name: []const u8, command: []const u8, cmd_id: u32) ![]u8 {
+    if (cmd_id == 0) {
+        return std.fmt.allocPrint(alloc, "ERR|{s}|dropped|queue_full\n", .{command});
+    }
+    return std.fmt.allocPrint(alloc, "QUEUED|{s}|{s}|{d}\n", .{ session_name, command, cmd_id });
+}
 
 extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
 
@@ -590,6 +616,9 @@ const MockState = struct {
     pane_pid: u32 = 4321,
     cursor_row: i32 = 3,
     cursor_col: i32 = 7,
+    next_cmd_id: u32 = 1,
+    ack_poll_pending_before_drained: usize = 0,
+    ack_poll_calls: usize = 0,
 };
 
 var mock_state = MockState{};
@@ -599,7 +628,17 @@ fn mockSendInput(_: *anyopaque, text: []const u8, raw: bool, _: ?usize) u32 {
     @memcpy(mock_input_buf[0..text.len], text);
     mock_state.last_input = mock_input_buf[0..text.len];
     mock_state.last_input_raw = raw;
-    return 1; // mock cmd_id
+    return mock_state.next_cmd_id;
+}
+
+fn mockAckPoll(_: *anyopaque, cmd_id: u32) bool {
+    if (cmd_id == 0 or cmd_id != mock_state.next_cmd_id) return false;
+    if (mock_state.ack_poll_calls < mock_state.ack_poll_pending_before_drained) {
+        mock_state.ack_poll_calls += 1;
+        return false;
+    }
+    mock_state.ack_poll_calls += 1;
+    return true;
 }
 
 fn mockCaptureSnapshot(_: *anyopaque, _: usize, result: *CombinedSnapshot) bool {
@@ -655,6 +694,7 @@ var mock_provider_storage = Provider{
     .ctx = undefined,
     .captureSnapshot = &mockCaptureSnapshot,
     .sendInput = &mockSendInput,
+    .ackPoll = &mockAckPoll,
     .newTab = &mockNewTab,
     .closeTab = &mockCloseTab,
     .switchTab = &mockSwitchTab,
@@ -717,7 +757,7 @@ test "handleRequest CAPABILITIES" {
     try std.testing.expect(std.mem.startsWith(u8, resp, "OK|test-session|CAPABILITIES|"));
     try std.testing.expect(std.mem.indexOf(u8, resp, "transport=polling") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "reads=STATE,CAPTURE_PANE,TAIL,HISTORY,WAIT_FOR,PANE_PID,CURSOR_POS,PANE_TITLE,LIST_TABS") != null);
-    try std.testing.expect(std.mem.indexOf(u8, resp, "writes=INPUT,RAW_INPUT,PASTE,SEND_KEYS,ACK_POLL") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "writes=INPUT,RAW_INPUT,PASTE,SEND_KEYS,ACK_POLL,WAIT_DRAIN") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "control=NEW_TAB,CLOSE_TAB,SWITCH_TAB,FOCUS") != null);
 }
 
@@ -867,6 +907,52 @@ test "handleRequest SEND_KEYS invalid key returns error" {
     const resp = try cp.handleRequest("SEND_KEYS|agent|INVALID_KEY");
     defer std.testing.allocator.free(resp);
     try std.testing.expect(std.mem.indexOf(u8, resp, "INVALID_KEY") != null);
+}
+
+test "handleRequest INPUT dropped returns queue_full wire error" {
+    var cp = try initTestCp();
+    defer cp.deinit();
+    mock_state.next_cmd_id = 0;
+    var line = "INPUT|agent|aGVsbG8=".*;
+    const resp = try cp.handleRequest(&line);
+    defer std.testing.allocator.free(resp);
+    try std.testing.expectEqualStrings("ERR|INPUT|dropped|queue_full\n", resp);
+}
+
+test "handleRequest ACK_POLL drained" {
+    var cp = try initTestCp();
+    defer cp.deinit();
+    const resp = try cp.handleRequest("ACK_POLL|1");
+    defer std.testing.allocator.free(resp);
+    try std.testing.expectEqualStrings("ACK_POLL|1|drained\n", resp);
+}
+
+test "handleRequest ACK_POLL pending" {
+    var cp = try initTestCp();
+    defer cp.deinit();
+    mock_state.ack_poll_pending_before_drained = 2;
+    const resp = try cp.handleRequest("ACK_POLL|1");
+    defer std.testing.allocator.free(resp);
+    try std.testing.expectEqualStrings("ACK_POLL|1|pending\n", resp);
+}
+
+test "handleRequest WAIT_DRAIN drained via polling" {
+    var cp = try initTestCp();
+    defer cp.deinit();
+    mock_state.ack_poll_pending_before_drained = 2;
+    const resp = try cp.handleRequest("WAIT_DRAIN|1|250");
+    defer std.testing.allocator.free(resp);
+    try std.testing.expectEqualStrings("WAIT_DRAIN|1|drained\n", resp);
+    try std.testing.expect(mock_state.ack_poll_calls >= 3);
+}
+
+test "handleRequest WAIT_DRAIN timeout via polling" {
+    var cp = try initTestCp();
+    defer cp.deinit();
+    mock_state.ack_poll_pending_before_drained = 100;
+    const resp = try cp.handleRequest("WAIT_DRAIN|1|50");
+    defer std.testing.allocator.free(resp);
+    try std.testing.expectEqualStrings("WAIT_DRAIN|1|timeout\n", resp);
 }
 
 test "handleRequest deprecated commands" {

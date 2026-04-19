@@ -62,6 +62,7 @@ pub const Request = union(enum) {
     subscribe: SubscribeTopic,
     unsubscribe: SubscribeTopic,
     ack_poll: u32, // cmd_id to check
+    wait_drain: struct { cmd_id: u32, timeout_ms: u32 },
 };
 
 pub const ParseError = error{
@@ -217,6 +218,14 @@ pub fn parse(line: []const u8) ParseError!Request {
         return .{ .ack_poll = cmd_id };
     }
 
+    if (std.mem.eql(u8, cmd, "WAIT_DRAIN")) {
+        const id_str = it.next() orelse return ParseError.MissingField;
+        const timeout_str = it.next() orelse return ParseError.MissingField;
+        const cmd_id = std.fmt.parseInt(u32, id_str, 10) catch return ParseError.MissingField;
+        const timeout_ms = std.fmt.parseInt(u32, timeout_str, 10) catch return ParseError.MissingField;
+        return .{ .wait_drain = .{ .cmd_id = cmd_id, .timeout_ms = timeout_ms } };
+    }
+
     return ParseError.UnknownCommand;
 }
 
@@ -246,7 +255,7 @@ pub fn formatAck(alloc: Allocator, session_name: []const u8, pid: u32) ![]u8 {
 pub fn formatCapabilities(alloc: Allocator, session_name: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         alloc,
-        "OK|{s}|CAPABILITIES|transport=polling|reads=STATE,CAPTURE_PANE,TAIL,HISTORY,WAIT_FOR,PANE_PID,CURSOR_POS,PANE_TITLE,LIST_TABS|writes=INPUT,RAW_INPUT,PASTE,SEND_KEYS,ACK_POLL|control=NEW_TAB,CLOSE_TAB,SWITCH_TAB,FOCUS\n",
+        "OK|{s}|CAPABILITIES|transport=polling|reads=STATE,CAPTURE_PANE,TAIL,HISTORY,WAIT_FOR,PANE_PID,CURSOR_POS,PANE_TITLE,LIST_TABS|writes=INPUT,RAW_INPUT,PASTE,SEND_KEYS,ACK_POLL,WAIT_DRAIN|control=NEW_TAB,CLOSE_TAB,SWITCH_TAB,FOCUS\n",
         .{session_name},
     );
 }
@@ -505,6 +514,25 @@ test "parse WAIT_FOR" {
                 .index => |idx| try std.testing.expectEqual(@as(usize, 2), idx),
                 else => return error.TestUnexpectedResult,
             }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse ACK_POLL" {
+    const req = try parse("ACK_POLL|42");
+    switch (req) {
+        .ack_poll => |cmd_id| try std.testing.expectEqual(@as(u32, 42), cmd_id),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse WAIT_DRAIN" {
+    const req = try parse("WAIT_DRAIN|42|1500");
+    switch (req) {
+        .wait_drain => |w| {
+            try std.testing.expectEqual(@as(u32, 42), w.cmd_id);
+            try std.testing.expectEqual(@as(u32, 1500), w.timeout_ms);
         },
         else => return error.TestUnexpectedResult,
     }
