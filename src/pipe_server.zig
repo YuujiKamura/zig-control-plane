@@ -56,6 +56,13 @@ const ERROR_BROKEN_PIPE = 109;
 const ERROR_NO_DATA = 232;
 const ERROR_PIPE_CONNECTED = 535;
 
+/// Maximum time `writeAll` will wait for a slow/non-draining client before
+/// cancelling the pending WriteFile and returning `error.WriteTimeout`.
+/// Without this bound a client that opens the pipe but never calls ReadFile
+/// (e.g. a stalled deckpilot) wedges the server's clientThread forever and
+/// eventually exhausts `nMaxInstances=255` (issue #222).
+const WRITE_TIMEOUT_MS: DWORD = 5000;
+
 pub const PipeServer = struct {
     pipe_path_w: [:0]const u16,
     stop_flag: std.atomic.Value(bool),
@@ -323,14 +330,23 @@ pub const PipeServer = struct {
             defer self.allocator.free(response);
             log.debug("handleClient: handler returned {d} bytes, writing response...", .{response.len});
             writeAll(pipe, response) catch |err| {
-                log.err("handleClient: writeAll failed: {}", .{err});
+                // WriteTimeout / BrokenPipe are expected under slow or
+                // disconnected clients; treat as warn so the noisy code
+                // path does not look like a server-side fault (issue #222).
+                log.warn("handleClient: writeAll failed: {}", .{err});
                 return;
             };
             log.debug("handleClient: response written OK", .{});
 
             if (!persistent) {
-                // Flush so the client can read before we disconnect.
-                _ = k32.FlushFileBuffers(pipe);
+                // NOTE (issue #222): the previous code called
+                // `FlushFileBuffers(pipe)` here. That call blocks
+                // unboundedly until the client drains the pipe (same
+                // failure mode as the writeAll wedge we just fixed) and
+                // is unnecessary for short responses on a byte-mode named
+                // pipe — the OS retains buffered bytes until the client
+                // reads them or the handle is closed. Dropping the flush
+                // closes the residual writeAll-side stall window.
                 break;
             }
         }
@@ -450,6 +466,13 @@ pub const PipeServer = struct {
 
     /// Write all bytes to the pipe using overlapped I/O.
     /// Uses its own OVERLAPPED to avoid interfering with any other I/O on this handle.
+    ///
+    /// Bounded by `WRITE_TIMEOUT_MS` (issue #222): a client that does not
+    /// drain the pipe used to wedge `GetOverlappedResult(bWait=TRUE)` forever
+    /// and leak the clientThread, eventually exhausting `nMaxInstances`.
+    /// On timeout we `CancelIoEx` the pending write and return
+    /// `error.WriteTimeout`. The defer in `clientThread` then disconnects
+    /// and closes the pipe handle so the slot is reclaimed.
     fn writeAll(pipe: HANDLE, data: []const u8) !void {
         const ev = w.CreateEventExW(null, null, CREATE_EVENT_MANUAL_RESET, EVENT_ALL_ACCESS) catch
             return error.Unexpected;
@@ -467,11 +490,28 @@ pub const PipeServer = struct {
             }
         }
 
+        // Wait for completion with a hard upper bound rather than the
+        // unbounded GetOverlappedResult(bWait=TRUE) used previously.
+        const wait = k32.WaitForSingleObject(ev, WRITE_TIMEOUT_MS);
+        if (wait != WAIT_OBJECT_0) {
+            // Either WAIT_TIMEOUT or a signalling error. Cancel the pending
+            // write and drain the cancellation so `overlapped` stays valid
+            // until the IO is fully aborted.
+            _ = k32.CancelIoEx(pipe, &overlapped);
+            _ = k32.WaitForSingleObject(ev, CANCEL_DRAIN_TIMEOUT_MS);
+            if (wait == WAIT_TIMEOUT) {
+                log.warn("writeAll: WriteFile did not complete within {d}ms; cancelling (issue #222)", .{WRITE_TIMEOUT_MS});
+                return error.WriteTimeout;
+            }
+            return error.Unexpected;
+        }
+
         var bytes_written: DWORD = 0;
-        if (GetOverlappedResult(pipe, &overlapped, &bytes_written, 1) == 0) {
+        // bWait=FALSE is now safe — the event is already signalled.
+        if (GetOverlappedResult(pipe, &overlapped, &bytes_written, 0) == 0) {
             const write_err = @intFromEnum(w.kernel32.GetLastError());
             if (write_err == ERROR_NO_DATA or write_err == ERROR_BROKEN_PIPE) return error.BrokenPipe;
-            if (write_err == ERROR_OPERATION_ABORTED) return error.Unexpected;
+            if (write_err == ERROR_OPERATION_ABORTED) return error.WriteTimeout;
             return error.Unexpected;
         }
         if (bytes_written != data.len) return error.Unexpected;
