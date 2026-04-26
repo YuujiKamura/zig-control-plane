@@ -1,7 +1,18 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+
+// Win32 process-liveness probing (used by cleanupStaleSessions).
+const HANDLE = *anyopaque;
+const DWORD = u32;
+const BOOL = i32;
+const PROCESS_QUERY_LIMITED_INFORMATION: DWORD = 0x1000;
+const STILL_ACTIVE: DWORD = 259;
+extern "kernel32" fn OpenProcess(dwDesiredAccess: DWORD, bInheritHandle: BOOL, dwProcessId: DWORD) callconv(.winapi) ?HANDLE;
+extern "kernel32" fn CloseHandle(hObject: HANDLE) callconv(.winapi) BOOL;
+extern "kernel32" fn GetExitCodeProcess(hProcess: HANDLE, lpExitCode: *DWORD) callconv(.winapi) BOOL;
 
 pub const SessionManager = struct {
     session_name: []const u8,
@@ -186,6 +197,125 @@ fn deleteFileFromPath(path: []const u8) !void {
     };
 }
 
+/// Predicate signature for liveness checks. Returns true iff `pid` is still alive.
+/// Hoisted to a public type so `cleanupStaleSessionsIn` can be tested without
+/// relying on real OS processes.
+pub const IsAliveFn = *const fn (pid: u32) bool;
+
+/// Default Win32-backed liveness probe. On non-Windows targets this conservatively
+/// returns true so stale-session cleanup never deletes a peer session by accident.
+pub fn defaultIsAlive(pid: u32) bool {
+    if (builtin.os.tag != .windows) return true;
+    if (pid == 0) return false;
+    const handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) orelse return false;
+    defer _ = CloseHandle(handle);
+    var code: DWORD = 0;
+    if (GetExitCodeProcess(handle, &code) == 0) return false;
+    return code == STILL_ACTIVE;
+}
+
+fn parsePidFromSessionFile(content: []const u8) ?u32 {
+    // Session files contain `key=value` lines; we want the `pid=` line.
+    var iter = std.mem.tokenizeAny(u8, content, "\r\n");
+    while (iter.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t");
+        if (!std.mem.startsWith(u8, trimmed, "pid=")) continue;
+        const value = std.mem.trim(u8, trimmed["pid=".len..], " \t");
+        if (value.len == 0) continue;
+        return std.fmt.parseInt(u32, value, 10) catch null;
+    }
+    return null;
+}
+
+/// Counts of stale-session sweep results.
+pub const CleanupStats = struct {
+    scanned: usize = 0,
+    removed: usize = 0,
+    skipped_alive: usize = 0,
+    skipped_unparsable: usize = 0,
+    errors: usize = 0,
+};
+
+/// Sweep `dir_path` for `*.session` files whose `pid=` line points at a dead
+/// process and delete them. Pure I/O over `dir_path`; safe to call from `init()`
+/// before this process has written its own session file (the current PID will be
+/// reported alive by `is_alive_fn` so we never wipe ourselves).
+pub fn cleanupStaleSessionsIn(
+    allocator: Allocator,
+    dir_path: []const u8,
+    is_alive_fn: IsAliveFn,
+) !CleanupStats {
+    var stats: CleanupStats = .{};
+
+    var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch |err| switch (err) {
+        // No directory yet => no stale files; treat as a clean sweep.
+        error.FileNotFound => return stats,
+        else => return err,
+    };
+    defer dir.close();
+
+    var iter = dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".session")) continue;
+        stats.scanned += 1;
+
+        const file = dir.openFile(entry.name, .{}) catch {
+            stats.errors += 1;
+            continue;
+        };
+        const content = file.readToEndAlloc(allocator, 64 * 1024) catch {
+            file.close();
+            stats.errors += 1;
+            continue;
+        };
+        file.close();
+        defer allocator.free(content);
+
+        const pid = parsePidFromSessionFile(content) orelse {
+            stats.skipped_unparsable += 1;
+            continue;
+        };
+
+        if (is_alive_fn(pid)) {
+            stats.skipped_alive += 1;
+            continue;
+        }
+
+        dir.deleteFile(entry.name) catch {
+            stats.errors += 1;
+            continue;
+        };
+        stats.removed += 1;
+    }
+
+    return stats;
+}
+
+/// Convenience wrapper: derive the sessions directory from `app_name` (same
+/// scheme as `SessionManager.init`) and sweep stale files using `defaultIsAlive`.
+pub fn cleanupStaleSessions(allocator: Allocator, app_name: []const u8) !CleanupStats {
+    const dir_name = if (std.mem.indexOfScalar(u8, app_name, '-')) |idx|
+        app_name[0..idx]
+    else
+        app_name;
+
+    const local_app_data = std.process.getEnvVarOwned(allocator, "LOCALAPPDATA") catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => return CleanupStats{},
+        else => return err,
+    };
+    defer allocator.free(local_app_data);
+
+    const sessions_dir = try std.fmt.allocPrint(
+        allocator,
+        "{s}\\{s}\\control-plane\\winui3\\sessions",
+        .{ local_app_data, dir_name },
+    );
+    defer allocator.free(sessions_dir);
+
+    return cleanupStaleSessionsIn(allocator, sessions_dir, defaultIsAlive);
+}
+
 // ============ Tests ============
 
 test "sanitize session name" {
@@ -288,4 +418,100 @@ test "remove file" {
     // File should be gone
     const result = std.fs.openFileAbsolute(session_file, .{});
     try std.testing.expect(if (result) |_| false else |_| true);
+}
+
+test "parsePidFromSessionFile extracts pid line" {
+    try std.testing.expectEqual(@as(?u32, 12345), parsePidFromSessionFile(
+        "session_name=foo\nsafe_session_name=foo\npid=12345\nhwnd=0xDEAD\npipe_path=x\n",
+    ));
+    try std.testing.expectEqual(@as(?u32, 7), parsePidFromSessionFile("pid=7\n"));
+    // Trailing CRLF and whitespace tolerated.
+    try std.testing.expectEqual(@as(?u32, 99), parsePidFromSessionFile("pid=99 \r\n"));
+    // Missing pid line.
+    try std.testing.expectEqual(@as(?u32, null), parsePidFromSessionFile("hwnd=0x1\n"));
+    // Non-numeric pid.
+    try std.testing.expectEqual(@as(?u32, null), parsePidFromSessionFile("pid=abc\n"));
+}
+
+const TestPidPredicate = struct {
+    var alive_pid: u32 = 0;
+    fn isAlive(pid: u32) bool {
+        return pid == alive_pid;
+    }
+};
+
+test "cleanupStaleSessionsIn removes dead-pid files and keeps live ones" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const sep = std.fs.path.sep;
+
+    // Three session files: one alive, one dead, one with no pid line.
+    inline for (.{
+        .{ "alive.session", "session_name=a\npid=42\nhwnd=0x1\n" },
+        .{ "dead.session", "session_name=b\npid=99999\nhwnd=0x2\n" },
+        .{ "broken.session", "session_name=c\nhwnd=0x3\n" },
+        // A non-session file must be left untouched.
+        .{ "ignore-me.txt", "pid=99999\n" },
+    }) |pair| {
+        const name, const body = pair;
+        const path = try std.fmt.allocPrint(allocator, "{s}{c}{s}", .{ tmp_path, sep, name });
+        defer allocator.free(path);
+        const f = try std.fs.createFileAbsolute(path, .{});
+        defer f.close();
+        try f.writeAll(body);
+    }
+
+    TestPidPredicate.alive_pid = 42;
+
+    const stats = try cleanupStaleSessionsIn(allocator, tmp_path, TestPidPredicate.isAlive);
+    try std.testing.expectEqual(@as(usize, 3), stats.scanned);
+    try std.testing.expectEqual(@as(usize, 1), stats.removed);
+    try std.testing.expectEqual(@as(usize, 1), stats.skipped_alive);
+    try std.testing.expectEqual(@as(usize, 1), stats.skipped_unparsable);
+    try std.testing.expectEqual(@as(usize, 0), stats.errors);
+
+    // alive.session and broken.session must remain; dead.session must be gone.
+    const alive_path = try std.fmt.allocPrint(allocator, "{s}{c}alive.session", .{ tmp_path, sep });
+    defer allocator.free(alive_path);
+    _ = try std.fs.openFileAbsolute(alive_path, .{});
+
+    const broken_path = try std.fmt.allocPrint(allocator, "{s}{c}broken.session", .{ tmp_path, sep });
+    defer allocator.free(broken_path);
+    _ = try std.fs.openFileAbsolute(broken_path, .{});
+
+    const dead_path = try std.fmt.allocPrint(allocator, "{s}{c}dead.session", .{ tmp_path, sep });
+    defer allocator.free(dead_path);
+    try std.testing.expectError(error.FileNotFound, std.fs.openFileAbsolute(dead_path, .{}));
+
+    // The non-session file must also remain.
+    const ignore_path = try std.fmt.allocPrint(allocator, "{s}{c}ignore-me.txt", .{ tmp_path, sep });
+    defer allocator.free(ignore_path);
+    _ = try std.fs.openFileAbsolute(ignore_path, .{});
+}
+
+test "cleanupStaleSessionsIn returns zero stats when directory missing" {
+    const allocator = std.testing.allocator;
+
+    // Build a path that almost certainly does not exist on either OS.
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    const missing = try std.fmt.allocPrint(
+        allocator,
+        "{s}{c}does-not-exist-cp-cleanup",
+        .{ tmp_path, std.fs.path.sep },
+    );
+    defer allocator.free(missing);
+
+    const stats = try cleanupStaleSessionsIn(allocator, missing, TestPidPredicate.isAlive);
+    try std.testing.expectEqual(@as(usize, 0), stats.scanned);
+    try std.testing.expectEqual(@as(usize, 0), stats.removed);
 }
