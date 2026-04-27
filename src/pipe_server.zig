@@ -63,6 +63,127 @@ const ERROR_PIPE_CONNECTED = 535;
 /// eventually exhausts `nMaxInstances=255` (issue #222).
 const WRITE_TIMEOUT_MS: DWORD = 5000;
 
+// ── Rate limit (issue #211) ──
+//
+// Per-client token-bucket on *write* commands (INPUT/RAW_INPUT/PASTE/SEND_KEYS).
+// Read commands (PING, STATE, TAIL, etc.) do not consume backend queue capacity
+// and are intentionally not gated.
+//
+// Defaults are tuned so that legitimate operators (e.g. deckpilot
+// auto-approvals at 0.5 req/s) sit far below the sustained rate, while a
+// runaway client gets back-pressure feedback (`ERR|RATE_LIMITED|<retry_ms>\n`)
+// instead of silent enqueueInput drops at the apprt layer.
+//
+// All knobs are overridable via environment variables read once at startup:
+//   KS_CP_RATE_BURST           — bucket capacity (default 10)
+//   KS_CP_RATE_SUSTAINED_PER_SEC — refill rate (default 2)
+//   KS_CP_RATE_DISABLE=1       — bypass rate limiting (debug)
+const DEFAULT_RATE_BURST: f64 = 10.0;
+const DEFAULT_RATE_SUSTAINED_PER_SEC: f64 = 2.0;
+
+const RateLimitConfig = struct {
+    burst: f64,
+    sustained_per_sec: f64,
+    disabled: bool,
+};
+
+fn readEnvF64(name: []const u8, default_v: f64) f64 {
+    const value = std.process.getEnvVarOwned(std.heap.page_allocator, name) catch return default_v;
+    defer std.heap.page_allocator.free(value);
+    if (value.len == 0) return default_v;
+    return std.fmt.parseFloat(f64, value) catch default_v;
+}
+
+fn readEnvBool(name: []const u8) bool {
+    const value = std.process.getEnvVarOwned(std.heap.page_allocator, name) catch return false;
+    defer std.heap.page_allocator.free(value);
+    return std.mem.eql(u8, value, "1") or std.ascii.eqlIgnoreCase(value, "true");
+}
+
+fn loadRateLimitConfig() RateLimitConfig {
+    return .{
+        .burst = @max(1.0, readEnvF64("KS_CP_RATE_BURST", DEFAULT_RATE_BURST)),
+        .sustained_per_sec = @max(0.1, readEnvF64("KS_CP_RATE_SUSTAINED_PER_SEC", DEFAULT_RATE_SUSTAINED_PER_SEC)),
+        .disabled = readEnvBool("KS_CP_RATE_DISABLE"),
+    };
+}
+
+/// Per-client token bucket. Created on the clientThread stack — no lock
+/// needed because mutation is single-threaded per client.
+const TokenBucket = struct {
+    tokens: f64,
+    last_refill_ns: i128,
+    cfg: RateLimitConfig,
+    /// Squelches per-bucket "rate-limited" log spam: at most one warn per
+    /// LOG_SQUELCH_NS interval per client (rate-limit-on-rate-limit-log).
+    last_warn_ns: i128 = 0,
+
+    const LOG_SQUELCH_NS: i128 = 1 * std.time.ns_per_s;
+
+    fn init(cfg: RateLimitConfig) TokenBucket {
+        return .{
+            .tokens = cfg.burst,
+            .last_refill_ns = std.time.nanoTimestamp(),
+            .cfg = cfg,
+        };
+    }
+
+    fn refill(self: *TokenBucket, now_ns: i128) void {
+        const dt_ns = now_ns - self.last_refill_ns;
+        if (dt_ns <= 0) return;
+        const dt_s: f64 = @as(f64, @floatFromInt(dt_ns)) / @as(f64, std.time.ns_per_s);
+        self.tokens = @min(self.cfg.burst, self.tokens + dt_s * self.cfg.sustained_per_sec);
+        self.last_refill_ns = now_ns;
+    }
+
+    /// Try to consume one token. Returns null on success, or the suggested
+    /// retry-after duration in milliseconds when the bucket is empty.
+    fn tryConsume(self: *TokenBucket) ?u32 {
+        if (self.cfg.disabled) return null;
+        const now_ns = std.time.nanoTimestamp();
+        self.refill(now_ns);
+        if (self.tokens >= 1.0) {
+            self.tokens -= 1.0;
+            return null;
+        }
+        const need = 1.0 - self.tokens;
+        const wait_s = need / self.cfg.sustained_per_sec;
+        const wait_ms_f = @ceil(wait_s * 1000.0);
+        const wait_ms: u32 = if (wait_ms_f < 1.0) 1 else if (wait_ms_f > @as(f64, @floatFromInt(std.math.maxInt(u32)))) std.math.maxInt(u32) else @intFromFloat(wait_ms_f);
+        return wait_ms;
+    }
+
+    fn maybeWarn(self: *TokenBucket, retry_ms: u32) void {
+        const now_ns = std.time.nanoTimestamp();
+        if (now_ns - self.last_warn_ns < LOG_SQUELCH_NS) return;
+        self.last_warn_ns = now_ns;
+        log.warn("rate limit triggered: retry_after_ms={d} burst={d:.1} rate={d:.2}/s (issue #211)", .{
+            retry_ms,
+            self.cfg.burst,
+            self.cfg.sustained_per_sec,
+        });
+    }
+};
+
+/// Returns true when a request line carries a write command that should
+/// consume one token. Read-only commands are unbounded.
+fn isRateLimitedRequest(request: []const u8) bool {
+    // The protocol uses `|` as separator, so command is everything before
+    // the first `|` (or the whole line if none).
+    const sep = std.mem.indexOfScalar(u8, request, '|') orelse request.len;
+    const cmd = request[0..sep];
+    return std.mem.eql(u8, cmd, "INPUT") or
+        std.mem.eql(u8, cmd, "RAW_INPUT") or
+        std.mem.eql(u8, cmd, "PASTE") or
+        std.mem.eql(u8, cmd, "SEND_KEYS");
+}
+
+/// Build the wire response sent when a request is rejected by the bucket.
+/// Same format family as `ERR|BUSY|...` (#207): `ERR|RATE_LIMITED|<retry_ms>\n`.
+fn formatRateLimited(buf: []u8, retry_ms: u32) []const u8 {
+    return std.fmt.bufPrint(buf, "ERR|RATE_LIMITED|{d}\n", .{retry_ms}) catch "ERR|RATE_LIMITED|1000\n";
+}
+
 pub const PipeServer = struct {
     pipe_path_w: [:0]const u16,
     stop_flag: std.atomic.Value(bool),
@@ -284,6 +405,8 @@ pub const PipeServer = struct {
         var carry: [65536]u8 = undefined;
         var carry_len: usize = 0;
         var persistent = false;
+        // Per-client token bucket — see issue #211.
+        var bucket = TokenBucket.init(loadRateLimitConfig());
 
         while (!self.stop_flag.load(.monotonic)) {
             // 1) Try to get a complete request line
@@ -324,7 +447,23 @@ pub const PipeServer = struct {
                 continue;
             }
 
-            // 4) Dispatch to handler
+            // 4) Rate-limit gate (issue #211): only mutating commands cost a
+            //    token. Read-only commands pass through untouched.
+            if (isRateLimitedRequest(request)) {
+                if (bucket.tryConsume()) |retry_ms| {
+                    bucket.maybeWarn(retry_ms);
+                    var rl_buf: [64]u8 = undefined;
+                    const rl_resp = formatRateLimited(&rl_buf, retry_ms);
+                    writeAll(pipe, rl_resp) catch |err| {
+                        log.warn("handleClient: rate-limit writeAll failed: {}", .{err});
+                        return;
+                    };
+                    if (!persistent) break;
+                    continue;
+                }
+            }
+
+            // 5) Dispatch to handler
             log.debug("handleClient: dispatching to handler...", .{});
             const response = self.handler(request, self.ctx, self.allocator);
             defer self.allocator.free(response);
@@ -537,6 +676,63 @@ pub const PipeServer = struct {
 // ── Tests ──
 
 const testing = std.testing;
+
+// ── Rate-limit unit tests (issue #211) ──
+
+test "isRateLimitedRequest classifies write commands" {
+    try testing.expect(isRateLimitedRequest("INPUT|agent|aGk="));
+    try testing.expect(isRateLimitedRequest("RAW_INPUT|agent|aGk="));
+    try testing.expect(isRateLimitedRequest("PASTE|agent|aGk="));
+    try testing.expect(isRateLimitedRequest("SEND_KEYS|agent|Enter"));
+
+    try testing.expect(!isRateLimitedRequest("PING"));
+    try testing.expect(!isRateLimitedRequest("STATE"));
+    try testing.expect(!isRateLimitedRequest("TAIL|10"));
+    try testing.expect(!isRateLimitedRequest("CAPABILITIES"));
+    try testing.expect(!isRateLimitedRequest("ACK_POLL|7"));
+    try testing.expect(!isRateLimitedRequest("WAIT_DRAIN|7|500"));
+    try testing.expect(!isRateLimitedRequest("PERSIST"));
+    try testing.expect(!isRateLimitedRequest("SUBSCRIBE|status"));
+}
+
+test "TokenBucket allows burst then rate-limits" {
+    var bucket = TokenBucket.init(.{ .burst = 3, .sustained_per_sec = 1, .disabled = false });
+    // First 3 requests succeed (full burst).
+    try testing.expect(bucket.tryConsume() == null);
+    try testing.expect(bucket.tryConsume() == null);
+    try testing.expect(bucket.tryConsume() == null);
+    // 4th is rate-limited with a positive retry hint.
+    const retry = bucket.tryConsume();
+    try testing.expect(retry != null);
+    try testing.expect(retry.? >= 1);
+    // Suggested retry should be roughly 1/rate seconds (1000ms ± ceiling).
+    try testing.expect(retry.? <= 1100);
+}
+
+test "TokenBucket disabled bypasses limit" {
+    var bucket = TokenBucket.init(.{ .burst = 1, .sustained_per_sec = 1, .disabled = true });
+    var i: usize = 0;
+    while (i < 100) : (i += 1) {
+        try testing.expect(bucket.tryConsume() == null);
+    }
+}
+
+test "TokenBucket refills over time" {
+    var bucket = TokenBucket.init(.{ .burst = 2, .sustained_per_sec = 100, .disabled = false });
+    try testing.expect(bucket.tryConsume() == null);
+    try testing.expect(bucket.tryConsume() == null);
+    try testing.expect(bucket.tryConsume() != null);
+    // 50ms at 100/s → ~5 tokens, capped at burst (2). After sleep, two should pass.
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    try testing.expect(bucket.tryConsume() == null);
+    try testing.expect(bucket.tryConsume() == null);
+}
+
+test "formatRateLimited emits expected wire shape" {
+    var buf: [64]u8 = undefined;
+    const out = formatRateLimited(&buf, 250);
+    try testing.expectEqualStrings("ERR|RATE_LIMITED|250\n", out);
+}
 
 fn testHandler(request: []const u8, _: *anyopaque, allocator: Allocator) []const u8 {
     _ = request;
