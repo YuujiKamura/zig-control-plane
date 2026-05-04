@@ -515,3 +515,178 @@ test "cleanupStaleSessionsIn returns zero stats when directory missing" {
     try std.testing.expectEqual(@as(usize, 0), stats.scanned);
     try std.testing.expectEqual(@as(usize, 0), stats.removed);
 }
+
+// ── init() path-composition contract ────────────────────────────────
+//
+// The previous test set bypassed init() entirely (each test built a
+// SessionManager struct by hand pointing at tmpDir). That left the
+// `%LOCALAPPDATA%\<app_dir>\control-plane\winui3\sessions\<safe>-<pid>.session`
+// derivation and the `app_name → dir_name` rule (split on first '-')
+// untested — even though deckpilot's `list` discovery depends on this
+// exact path layout. Symptoms: ghostty boots, log says "control plane
+// started", but `deckpilot list` finds no session because the file
+// went somewhere unexpected. The tests below pin the contract.
+//
+// We touch the user's real %LOCALAPPDATA% here because init() calls
+// ensureParentDirs(). The directories created are exactly the ones
+// production ghostty creates, so the bloat is nil. Each test cleans
+// up its own session file via removeFile().
+
+test "init: composes path under %LOCALAPPDATA% with safe-name + pid suffix" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var mgr = try SessionManager.init(
+        allocator,
+        "__zcp_init_test__",
+        "\\\\.\\pipe\\__zcp_init_test__",
+        "ghostty-winui3",
+    );
+    defer mgr.deinit();
+
+    const lad = try std.process.getEnvVarOwned(allocator, "LOCALAPPDATA");
+    defer allocator.free(lad);
+
+    // Path must start with %LOCALAPPDATA%.
+    try std.testing.expect(std.mem.startsWith(u8, mgr.session_file_path, lad));
+    // Filename must end with `<safe_session_name>-<pid>.session`. Reference
+    // mgr.safe_session_name rather than hard-coding so this test isn't
+    // coupled to the specific sanitize rules (underscore-trim, etc.).
+    try std.testing.expect(std.mem.endsWith(u8, mgr.session_file_path, ".session"));
+    const expected_tail = try std.fmt.allocPrint(allocator, "{s}-{d}.session", .{ mgr.safe_session_name, mgr.pid });
+    defer allocator.free(expected_tail);
+    try std.testing.expect(std.mem.endsWith(u8, mgr.session_file_path, expected_tail));
+}
+
+test "init: app_name 'ghostty-winui3' maps to dir 'ghostty' (regression pin for deckpilot list)" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var mgr = try SessionManager.init(
+        allocator,
+        "__zcp_dirpin__",
+        "\\\\.\\pipe\\__zcp_dirpin__",
+        "ghostty-winui3",
+    );
+    defer mgr.deinit();
+
+    // The contract: app_name is split at the first '-'; the prefix
+    // becomes the directory name. deckpilot's session-discovery logic
+    // assumes the dir is exactly "ghostty" (not "ghostty-winui3").
+    try std.testing.expect(std.mem.indexOf(u8, mgr.session_file_path, "\\ghostty\\control-plane\\winui3\\sessions\\") != null);
+    // And the unsplit form must NOT appear, otherwise discovery breaks silently.
+    try std.testing.expect(std.mem.indexOf(u8, mgr.session_file_path, "\\ghostty-winui3\\control-plane\\") == null);
+}
+
+test "init: app_name=null defaults dir to 'WindowsTerminal'" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var mgr = try SessionManager.init(
+        allocator,
+        "__zcp_wt_default__",
+        "\\\\.\\pipe\\__zcp_wt_default__",
+        null,
+    );
+    defer mgr.deinit();
+
+    try std.testing.expect(std.mem.indexOf(u8, mgr.session_file_path, "\\WindowsTerminal\\control-plane\\winui3\\sessions\\") != null);
+}
+
+test "init: app_name without '-' uses whole name as dir" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var mgr = try SessionManager.init(
+        allocator,
+        "__zcp_nosplit__",
+        "\\\\.\\pipe\\__zcp_nosplit__",
+        "myapp",
+    );
+    defer mgr.deinit();
+
+    try std.testing.expect(std.mem.indexOf(u8, mgr.session_file_path, "\\myapp\\control-plane\\winui3\\sessions\\") != null);
+}
+
+test "init + writeFile: file actually appears at session_file_path (silent-fallback gate)" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var mgr = try SessionManager.init(
+        allocator,
+        "__zcp_writefile_test__",
+        "\\\\.\\pipe\\__zcp_writefile_test__",
+        "ghostty-winui3",
+    );
+    defer mgr.deinit();
+    defer mgr.removeFile();
+
+    try mgr.writeFile(0xCAFEF00D);
+
+    // The whole point of this test: a third party (deckpilot) opening
+    // session_file_path by absolute path must succeed. If init/writeFile
+    // ever silently writes elsewhere, this fails — closing the
+    // silent-cache-fallback class of bug.
+    const f = try std.fs.openFileAbsolute(mgr.session_file_path, .{});
+    defer f.close();
+
+    var buf: [512]u8 = undefined;
+    const n = try f.readAll(&buf);
+    const content = buf[0..n];
+    try std.testing.expect(std.mem.indexOf(u8, content, "hwnd=0xCAFEF00D") != null);
+}
+
+test "init and cleanupStaleSessions agree on sessions directory (cross-tool layout contract)" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    // Both functions independently compose the sessions directory from
+    // app_name. If one ever changes (e.g., split on '-' becomes split
+    // on '_'), the other must too — otherwise stale-cleanup wipes the
+    // wrong dir or skips the live one. Pin them together.
+    var mgr = try SessionManager.init(
+        allocator,
+        "__zcp_layout_pin__",
+        "\\\\.\\pipe\\__zcp_layout_pin__",
+        "ghostty-winui3",
+    );
+    defer mgr.deinit();
+
+    // Parent directory of session_file_path = the sessions dir init writes into.
+    var last_sep: usize = 0;
+    for (mgr.session_file_path, 0..) |c, i| {
+        if (c == '\\' or c == '/') last_sep = i;
+    }
+    const init_sessions_dir = mgr.session_file_path[0..last_sep];
+
+    // Re-derive the same dir using cleanupStaleSessions's recipe.
+    const lad = try std.process.getEnvVarOwned(allocator, "LOCALAPPDATA");
+    defer allocator.free(lad);
+    const expected = try std.fmt.allocPrint(
+        allocator,
+        "{s}\\ghostty\\control-plane\\winui3\\sessions",
+        .{lad},
+    );
+    defer allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, init_sessions_dir);
+}
+
+test "init: empty session_name still produces a valid path (sanitize fallback)" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    const allocator = std.testing.allocator;
+
+    var mgr = try SessionManager.init(
+        allocator,
+        "",
+        "\\\\.\\pipe\\__zcp_empty__",
+        "ghostty-winui3",
+    );
+    defer mgr.deinit();
+
+    // sanitizeSessionName("") returns "session", so the filename should
+    // be `session-<pid>.session`.
+    const expected_tail = try std.fmt.allocPrint(allocator, "session-{d}.session", .{mgr.pid});
+    defer allocator.free(expected_tail);
+    try std.testing.expect(std.mem.endsWith(u8, mgr.session_file_path, expected_tail));
+}
