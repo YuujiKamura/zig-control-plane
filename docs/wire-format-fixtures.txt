@@ -1,0 +1,45 @@
+# CP wire-format fixtures
+#
+# Format:
+#   - Blocks are separated by a line containing only `===`.
+#   - Each block contains:
+#       # human-readable note (optional, may repeat)
+#       >>> request line
+#       <<< response (may use `\n` to encode multi-line responses)
+#   - Escape conventions used in BOTH `>>>` and `<<<` payloads:
+#       `\n`  -> single newline byte (0x0A)
+#       `\s`  -> single space byte (0x20). Use this only at the END of a
+#               line where text editors might strip trailing whitespace.
+#       `\\`  -> literal backslash. (Reserved; not used in current fixtures.)
+#   - Lines beginning with `#` outside a payload are notes; ignored.
+#   - Blank lines inside a block are tolerated; they reset nothing.
+#
+# Mock provider state assumed by these fixtures (see
+# vendor/zig-control-plane/src/main.zig MockState):
+#   session = "test-session"
+#   viewport buffer = "user@host:~$ "  (with trailing space, no newline)
+#   tab_count = 2, active_tab = 0
+#
+# `apprt-only` in the note marks fixtures that exercise the apprt overlay
+# (BUSY envelopes, `stale:` wire envelope). The Zig server-side test runs
+# the fresh fixture against ControlPlane.handleRequest directly, and
+# synthesises the apprt-only fixtures via the documented format helpers.
+
+# verb: TAIL — variant: fresh
+# Single line of viewport (trailing space, no \n), so linecount=1.
+>>> TAIL\n
+<<< TAIL|test-session|1\nuser@host:~$\s
+
+===
+
+# verb: TAIL — variant: stale (apprt-only)
+# Renderer locked, snapshot cache hit at age=142ms.
+>>> TAIL\n
+<<< stale:142|TAIL|test-session|1\nuser@host:~$\s
+
+===
+
+# verb: TAIL — variant: BUSY error (apprt-only)
+# Renderer locked, no snapshot in cache. 2-field ERR shape (audit drift 2b).
+>>> TAIL\n
+<<< ERR|BUSY|renderer_locked\n

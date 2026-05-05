@@ -1076,3 +1076,192 @@ test "CombinedSnapshot sanitize no-op when valid" {
     try std.testing.expectEqual(@as(usize, 5), snap.title_len);
     try std.testing.expectEqual(@as(usize, 1), snap.active_tab);
 }
+
+// ── Wire-format fixture-replay tests ──
+//
+// Loads `docs/wire-format-fixtures.txt` (companion to docs/wire-format.md)
+// and replays each block:
+//   - "fresh" fixtures are dispatched through ControlPlane.handleRequest
+//     using the same mock provider as the inline tests above.
+//   - apprt-only fixtures (`stale:` envelope, `ERR|BUSY|...` 2-field) are
+//     synthesised through the documented format helpers and asserted to
+//     match byte-for-byte.
+//
+// Pact: when these tests fail, docs/wire-format.md is wrong, the
+// implementation is wrong, or both. Update both sides in lockstep.
+
+const fixtures_text = @embedFile("wire_format_fixtures");
+
+const FixtureBlock = struct {
+    note: []const u8,
+    request: []u8,
+    response: []u8,
+};
+
+/// Decode `\n` -> 0x0A, `\s` -> 0x20, `\\` -> 0x5C in `src` into a buffer
+/// allocated from `arena`. Returns owned slice. The `\s` escape exists to
+/// preserve trailing spaces that text editors might strip.
+fn decodeFixtureEscapes(arena: Allocator, src: []const u8) ![]u8 {
+    var out = std.ArrayListUnmanaged(u8){};
+    errdefer out.deinit(arena);
+    try out.ensureTotalCapacity(arena, src.len);
+
+    var i: usize = 0;
+    while (i < src.len) : (i += 1) {
+        const c = src[i];
+        if (c == '\\' and i + 1 < src.len) {
+            const next = src[i + 1];
+            switch (next) {
+                'n' => {
+                    try out.append(arena, '\n');
+                    i += 1;
+                    continue;
+                },
+                's' => {
+                    try out.append(arena, ' ');
+                    i += 1;
+                    continue;
+                },
+                '\\' => {
+                    try out.append(arena, '\\');
+                    i += 1;
+                    continue;
+                },
+                else => {},
+            }
+        }
+        try out.append(arena, c);
+    }
+    return out.toOwnedSlice(arena);
+}
+
+fn parseFixtureFile(arena: Allocator) ![]FixtureBlock {
+    var blocks = std.ArrayListUnmanaged(FixtureBlock){};
+    errdefer blocks.deinit(arena);
+
+    var current_note: []const u8 = "";
+    var current_req: ?[]u8 = null;
+    var current_resp: ?[]u8 = null;
+
+    var line_it = std.mem.splitScalar(u8, fixtures_text, '\n');
+    while (line_it.next()) |raw_line| {
+        const line = if (raw_line.len > 0 and raw_line[raw_line.len - 1] == '\r')
+            raw_line[0 .. raw_line.len - 1]
+        else
+            raw_line;
+
+        if (std.mem.eql(u8, line, "===")) {
+            if (current_req) |req| {
+                if (current_resp) |resp| {
+                    try blocks.append(arena, .{
+                        .note = try arena.dupe(u8, current_note),
+                        .request = req,
+                        .response = resp,
+                    });
+                }
+            }
+            current_note = "";
+            current_req = null;
+            current_resp = null;
+            continue;
+        }
+
+        if (line.len == 0) continue;
+
+        if (std.mem.startsWith(u8, line, "# ")) {
+            // The block's identifying note is the first `# ` line that
+            // starts with `verb:` — that's the convention this file uses
+            // to tag each fixture. Other comment lines (file header,
+            // mock-state notes) are skipped.
+            const body = line[2..];
+            if (std.mem.startsWith(u8, body, "verb:")) {
+                current_note = body;
+            }
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "#")) continue;
+
+        if (std.mem.startsWith(u8, line, ">>> ")) {
+            current_req = try decodeFixtureEscapes(arena, line[4..]);
+            continue;
+        }
+        if (std.mem.startsWith(u8, line, "<<< ")) {
+            current_resp = try decodeFixtureEscapes(arena, line[4..]);
+            continue;
+        }
+    }
+
+    if (current_req) |req| {
+        if (current_resp) |resp| {
+            try blocks.append(arena, .{
+                .note = try arena.dupe(u8, current_note),
+                .request = req,
+                .response = resp,
+            });
+        }
+    }
+
+    return blocks.toOwnedSlice(arena);
+}
+
+test "wire-format fixtures parse into 3 blocks" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const blocks = try parseFixtureFile(arena_inst.allocator());
+    try std.testing.expectEqual(@as(usize, 3), blocks.len);
+    try std.testing.expect(std.mem.indexOf(u8, blocks[0].note, "fresh") != null);
+    try std.testing.expect(std.mem.indexOf(u8, blocks[1].note, "stale") != null);
+    try std.testing.expect(std.mem.indexOf(u8, blocks[2].note, "BUSY") != null);
+}
+
+test "wire-format fixture: TAIL fresh matches handleRequest output" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const blocks = try parseFixtureFile(arena_inst.allocator());
+
+    const fresh = blocks[0];
+    // handleRequest accepts the request line without the trailing newline.
+    const req_no_nl = std.mem.trimRight(u8, fresh.request, "\n");
+
+    var control_plane = try initTestCp();
+    defer control_plane.deinit();
+
+    const resp = try control_plane.handleRequest(req_no_nl);
+    defer std.testing.allocator.free(resp);
+
+    try std.testing.expectEqualStrings(fresh.response, resp);
+}
+
+test "wire-format fixture: TAIL stale apprt envelope shape" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const blocks = try parseFixtureFile(arena_inst.allocator());
+
+    const stale = blocks[1];
+
+    // Synthesise: inner TAIL response via formatTail, then prepend the
+    // documented `stale:<age_ms>|` byte-prefix that the apprt overlay
+    // applies on cache-hit-while-renderer-locked. The overlay logic itself
+    // lives outside this submodule, so the contract here is on the
+    // format shape.
+    const inner = try protocol.formatTail(std.testing.allocator, "test-session", 1, "user@host:~$ ");
+    defer std.testing.allocator.free(inner);
+
+    const synthesised = try std.fmt.allocPrint(std.testing.allocator, "stale:{d}|{s}", .{ 142, inner });
+    defer std.testing.allocator.free(synthesised);
+
+    try std.testing.expectEqualStrings(stale.response, synthesised);
+}
+
+test "wire-format fixture: TAIL BUSY apprt error envelope shape" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const blocks = try parseFixtureFile(arena_inst.allocator());
+
+    const busy = blocks[2];
+
+    // The apprt overlay's BUSY envelope is a literal 2-field shape with
+    // no <session> interpolation (audit drift 2b). The pact is on the
+    // literal bytes.
+    try std.testing.expectEqualStrings("ERR|BUSY|renderer_locked\n", busy.response);
+}

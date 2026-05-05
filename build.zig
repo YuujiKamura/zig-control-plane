@@ -15,6 +15,14 @@ pub fn build(b: *std.Build) void {
     const tests = b.addTest(.{
         .root_module = mod,
     });
+    // Expose docs/wire-format-fixtures.txt to @embedFile inside the test
+    // binary. The fixture file lives in docs/ (shared canonical location
+    // with the deckpilot vendored copy). We register it as a named
+    // module dependency on the test executable's root module; the test
+    // code then uses `@embedFile("wire_format_fixtures")`.
+    tests.root_module.addAnonymousImport("wire_format_fixtures", .{
+        .root_source_file = b.path("docs/wire-format-fixtures.txt"),
+    });
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
