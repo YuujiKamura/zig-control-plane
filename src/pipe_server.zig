@@ -193,6 +193,19 @@ pub const PipeServer = struct {
     allocator: Allocator,
     active_clients: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
+    /// Signalled by the server thread once the first `CreateNamedPipeW` call
+    /// has returned (success or failure). `start()` blocks on this so callers
+    /// may rely on the pipe being on the kernel object table by the time
+    /// `start()` returns. Without this, deckpilot's `probePID` could observe
+    /// `"control plane started"` in the apprt log before the kernel had a
+    /// pipe to ping (see cp-session-pivot-2026-05-05.md).
+    ready: std.Thread.ResetEvent = .{},
+    /// Set by the server thread before signalling `ready` if the first
+    /// `CreateNamedPipeW` failed. `start()` translates this into a returned
+    /// error so the caller can fail boot rather than logging "started" while
+    /// the pipe is missing.
+    ready_failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
     pub fn init(allocator: Allocator, pipe_name: []const u8, handler: HandlerFn, ctx: *anyopaque) !PipeServer {
         const pipe_path_w = try std.unicode.utf8ToUtf16LeAllocZ(allocator, pipe_name);
         return PipeServer{
@@ -206,6 +219,12 @@ pub const PipeServer = struct {
 
     pub fn start(self: *PipeServer) !void {
         self.command_thread = try std.Thread.spawn(.{}, serverThread, .{self});
+        // Block until the first CreateNamedPipeW has either succeeded
+        // (kernel object table now has our pipe) or definitively failed.
+        self.ready.wait();
+        if (self.ready_failed.load(.acquire)) {
+            return error.PipeCreateFailed;
+        }
     }
 
     pub fn stop(self: *PipeServer) void {
@@ -275,8 +294,17 @@ pub const PipeServer = struct {
         if (pipe == INVALID_HANDLE_VALUE) {
             const err = k32.GetLastError();
             log.err("CreateNamedPipeW FAILED err={d}", .{@intFromEnum(err)});
+            // Unblock start() with a failure outcome — first iteration only.
+            // ready.set() is idempotent; ready_failed is only meaningful to
+            // the first wait()er which is start().
+            if (!self.ready.isSet()) {
+                self.ready_failed.store(true, .release);
+                self.ready.set();
+            }
             return;
         }
+        // Unblock start() — pipe is on the kernel object table now.
+        if (!self.ready.isSet()) self.ready.set();
         log.debug("commandServerIteration: pipe created, waiting for client...", .{});
 
         // Create manual-reset event for overlapped I/O
@@ -739,6 +767,49 @@ fn testHandler(request: []const u8, _: *anyopaque, allocator: Allocator) []const
     return allocator.dupe(u8, "PONG|test\n") catch return "";
 }
 
+test "start() blocks until pipe is open for client connections (no sleep workaround)" {
+    // Pins the contract that fixes the deckpilot "No CP session available"
+    // race documented in cp-session-pivot-2026-05-05.md.
+    //
+    // Before this contract, every other test in this file slept 50ms after
+    // server.start() to let the spawned thread reach CreateNamedPipeW. That
+    // sleep was hiding the bug: in the real apprt boot path nothing sleeps
+    // between pipe_server.start() returning and `log.info("control plane
+    // started")`, so deckpilot's probePID could hit a window where the
+    // session file already advertises a pipe path that is not yet on the
+    // kernel object table.
+    //
+    // This test does NOT sleep. If start() returns before the first
+    // CreateNamedPipeW has completed, CreateFileW will fail with
+    // ERROR_FILE_NOT_FOUND and the test goes red.
+    const allocator = testing.allocator;
+    const pipe_name = "\\\\.\\pipe\\zig-cp-test-start-sync-no-sleep";
+    var dummy: u8 = 0;
+
+    var server = try PipeServer.init(allocator, pipe_name, &testHandler, @ptrCast(&dummy));
+    defer server.deinit();
+
+    try server.start();
+    // Intentionally NO std.Thread.sleep here.
+
+    const pipe_name_w = std.unicode.utf8ToUtf16LeStringLiteral("\\\\.\\pipe\\zig-cp-test-start-sync-no-sleep");
+    const client = k32.CreateFileW(
+        pipe_name_w,
+        w.GENERIC_READ | w.GENERIC_WRITE,
+        0,
+        null,
+        w.OPEN_EXISTING,
+        0,
+        null,
+    );
+    if (client == INVALID_HANDLE_VALUE) {
+        const err = @intFromEnum(k32.GetLastError());
+        std.debug.print("CreateFileW failed err={d} (likely ERROR_FILE_NOT_FOUND=2 → race confirmed)\n", .{err});
+        return error.PipeNotReadyAfterStart;
+    }
+    defer w.CloseHandle(client);
+}
+
 test "pipe server smoke test" {
     const allocator = testing.allocator;
 
@@ -750,9 +821,8 @@ test "pipe server smoke test" {
     defer server.deinit();
 
     try server.start();
-
-    // Give the server thread a moment to set up the pipe
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    // No post-start sleep needed — start() blocks until CreateNamedPipeW
+    // returns. See "start() blocks until pipe is open ..." test.
 
     // Connect as client
     const pipe_name_w = std.unicode.utf8ToUtf16LeStringLiteral("\\\\.\\pipe\\zig-cp-test-smoke");
@@ -869,7 +939,6 @@ test "SUBSCRIBE returns SUBSCRIBE_OK for known topics" {
     var server = try PipeServer.init(allocator, pipe_name, &testHandler, @ptrCast(&dummy));
     defer server.deinit();
     try server.start();
-    std.Thread.sleep(50 * std.time.ns_per_ms);
 
     const pipe_name_w = std.unicode.utf8ToUtf16LeStringLiteral("\\\\.\\pipe\\zig-cp-test-subscribe-noop");
     const client = try connectPersistClient(pipe_name_w);
@@ -893,7 +962,6 @@ test "SUBSCRIBE with unknown topic returns error" {
     var server = try PipeServer.init(allocator, pipe_name, &testHandler, @ptrCast(&dummy));
     defer server.deinit();
     try server.start();
-    std.Thread.sleep(50 * std.time.ns_per_ms);
 
     const pipe_name_w = std.unicode.utf8ToUtf16LeStringLiteral("\\\\.\\pipe\\zig-cp-test-unknown-topic");
     const client = try connectPersistClient(pipe_name_w);
@@ -918,7 +986,6 @@ test "UNSUBSCRIBE returns UNSUBSCRIBE_OK" {
     var server = try PipeServer.init(allocator, pipe_name, &testHandler, @ptrCast(&dummy));
     defer server.deinit();
     try server.start();
-    std.Thread.sleep(50 * std.time.ns_per_ms);
 
     const pipe_name_w = std.unicode.utf8ToUtf16LeStringLiteral("\\\\.\\pipe\\zig-cp-test-unsubscribe-noop");
     const client = try connectPersistClient(pipe_name_w);
@@ -944,7 +1011,6 @@ test "persistent connection stays alive across multiple commands" {
     var server = try PipeServer.init(allocator, pipe_name, &testHandler, @ptrCast(&dummy));
     defer server.deinit();
     try server.start();
-    std.Thread.sleep(50 * std.time.ns_per_ms);
 
     const pipe_name_w = std.unicode.utf8ToUtf16LeStringLiteral("\\\\.\\pipe\\zig-cp-test-persist-multi-cmd");
     const client = try connectPersistClient(pipe_name_w);
