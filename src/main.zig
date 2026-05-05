@@ -1204,14 +1204,17 @@ fn parseFixtureFile(arena: Allocator) ![]FixtureBlock {
     return blocks.toOwnedSlice(arena);
 }
 
-test "wire-format fixtures parse into 3 blocks" {
+test "wire-format fixtures parse into 4 blocks" {
     var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena_inst.deinit();
     const blocks = try parseFixtureFile(arena_inst.allocator());
-    try std.testing.expectEqual(@as(usize, 3), blocks.len);
+    try std.testing.expectEqual(@as(usize, 4), blocks.len);
+    try std.testing.expect(std.mem.indexOf(u8, blocks[0].note, "TAIL") != null);
     try std.testing.expect(std.mem.indexOf(u8, blocks[0].note, "fresh") != null);
     try std.testing.expect(std.mem.indexOf(u8, blocks[1].note, "stale") != null);
     try std.testing.expect(std.mem.indexOf(u8, blocks[2].note, "BUSY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, blocks[3].note, "PING") != null);
+    try std.testing.expect(std.mem.indexOf(u8, blocks[3].note, "fresh") != null);
 }
 
 test "wire-format fixture: TAIL fresh matches handleRequest output" {
@@ -1264,4 +1267,24 @@ test "wire-format fixture: TAIL BUSY apprt error envelope shape" {
     // no <session> interpolation (audit drift 2b). The pact is on the
     // literal bytes.
     try std.testing.expectEqualStrings("ERR|BUSY|renderer_locked\n", busy.response);
+}
+
+test "wire-format fixture: PING fresh matches handleRequest output" {
+    var arena_inst = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_inst.deinit();
+    const blocks = try parseFixtureFile(arena_inst.allocator());
+
+    const ping = blocks[3];
+    // handleRequest accepts the request line without the trailing newline.
+    const req_no_nl = std.mem.trimRight(u8, ping.request, "\n");
+
+    var control_plane = try initTestCp();
+    defer control_plane.deinit();
+
+    const resp = try control_plane.handleRequest(req_no_nl);
+    defer std.testing.allocator.free(resp);
+
+    // Lock byte-for-byte: PONG|test-session|12345|0xCAFE\n. Any drift in
+    // session_name, pid, hwnd, hex-format, or terminator breaks here.
+    try std.testing.expectEqualStrings(ping.response, resp);
 }

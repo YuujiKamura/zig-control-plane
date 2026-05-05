@@ -43,3 +43,13 @@
 # Renderer locked, no snapshot in cache. 2-field ERR shape (audit drift 2b).
 >>> TAIL\n
 <<< ERR|BUSY|renderer_locked\n
+
+===
+
+# verb: PING — variant: fresh
+# Smallest realistic verb: no payload in, fixed 4-field PONG out.
+# Mock state: pid=12345, hwnd_val=0xCAFE (see initTestCp + MockState defaults
+# in vendor/zig-control-plane/src/main.zig). The hwnd is hex-formatted with
+# 0x prefix (see formatPong in vendor/zig-control-plane/src/protocol.zig:248).
+>>> PING\n
+<<< PONG|test-session|12345|0xCAFE\n
