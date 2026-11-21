@@ -389,10 +389,14 @@ pub const PipeServer = struct {
             log.debug("clientThread: exiting", .{});
             _ = self.active_clients.fetchSub(1, .acq_rel);
         }
-        defer {
-            _ = DisconnectNamedPipe(pipe);
-            w.CloseHandle(pipe);
-        }
+        // Close only — no DisconnectNamedPipe. Each client gets its own pipe
+        // instance that is never reused, so there is nothing to reset, and
+        // DisconnectNamedPipe discards whatever the client has not read yet.
+        // With the FlushFileBuffers call gone (issue #222) that dropped
+        // replies whenever the client read a few ms after the write: a fast
+        // answer like CAPABILITIES or PING came back empty. CloseHandle
+        // leaves the written bytes readable; the client then sees EOF.
+        defer w.CloseHandle(pipe);
         self.handleClient(pipe);
     }
 
@@ -968,4 +972,47 @@ test "persistent connection stays alive across multiple commands" {
     try pipeSend(client, "SUBSCRIBE|status\n");
     const sub_resp = try pipeRecvLine(client, &buf);
     try testing.expectEqualStrings("SUBSCRIBE_OK|status\n", sub_resp);
+}
+
+// ── One-shot reply survives a late reader ──
+//
+// The server answers a one-shot request and closes its end at once. A
+// client that reads a little later (scheduler, GC, a slow script) must still
+// get the whole reply and then EOF. DisconnectNamedPipe in the cleanup path
+// used to discard the unread reply, so fast answers (PING, CAPABILITIES)
+// came back empty whenever the client read more than a few ms after writing.
+test "one-shot reply is readable after the server has closed (late reader)" {
+    const allocator = testing.allocator;
+    var dummy: u8 = 0;
+    var server = try PipeServer.init(allocator, "\\\\.\\pipe\\zig-cp-test-late-reader", &testHandler, @ptrCast(&dummy));
+    defer server.deinit();
+    try server.start();
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    const name_w = std.unicode.utf8ToUtf16LeStringLiteral("\\\\.\\pipe\\zig-cp-test-late-reader");
+    for ([_]u64{ 0, 50, 200, 0, 200 }) |delay_ms| {
+        // The server may still be creating the next instance; retry briefly.
+        var client: HANDLE = INVALID_HANDLE_VALUE;
+        var tries: usize = 0;
+        while (tries < 50) : (tries += 1) {
+            client = k32.CreateFileW(name_w, w.GENERIC_READ | w.GENERIC_WRITE, 0, null, w.OPEN_EXISTING, 0, null);
+            if (client != INVALID_HANDLE_VALUE) break;
+            std.Thread.sleep(10 * std.time.ns_per_ms);
+        }
+        try testing.expect(client != INVALID_HANDLE_VALUE);
+        defer w.CloseHandle(client);
+
+        try pipeSend(client, "PING\n");
+        std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+
+        var buf: [4096]u8 = undefined;
+        var total: usize = 0;
+        while (true) {
+            var n: DWORD = 0;
+            const ok = k32.ReadFile(client, @ptrCast(&buf[total]), @intCast(buf.len - total), &n, null);
+            if (ok == 0 or n == 0) break; // EOF (broken pipe) after the reply
+            total += n;
+        }
+        try testing.expect(std.mem.startsWith(u8, buf[0..total], "PONG"));
+    }
 }
