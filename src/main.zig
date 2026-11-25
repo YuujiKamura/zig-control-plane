@@ -86,6 +86,8 @@ pub const Provider = struct {
     /// Capture all tab state in one UI-thread call (Issue #142).
     /// This is the sole data-read path for STATE, TAIL, and LIST_TABS.
     captureSnapshot: *const fn (ctx: *anyopaque, tab_index: usize, result: *CombinedSnapshot) bool,
+    /// Optional authoritative tab IDs in current index order. Caller frees the slice.
+    listTabIds: ?*const fn (ctx: *anyopaque, allocator: Allocator) Allocator.Error![]u64 = null,
     /// Optional: capture full scrollback history. If null, falls back to captureSnapshot.
     captureHistory: ?*const fn (ctx: *anyopaque, tab_index: usize, result: *CombinedSnapshot) bool = null,
     /// Returns cmd_id for ACK tracking. 0 means the provider dropped the input
@@ -136,7 +138,7 @@ pub const ControlPlane = struct {
         var snap: CombinedSnapshot = .{};
         _ = provider.captureSnapshot(provider.ctx, 0, &snap);
         snap.sanitize();
-        try tab_mgr.syncTabs(snap.tab_count);
+        if (provider.listTabIds == null) try tab_mgr.syncTabs(snap.tab_count);
 
         const owned_name = try allocator.dupe(u8, session_name);
 
@@ -167,18 +169,39 @@ pub const ControlPlane = struct {
     }
 
     /// Resolve a TabTarget to a concrete tab index.
-    fn resolveTab(self: *ControlPlane, target: protocol.TabTarget) ?usize {
+    fn resolveTab(self: *ControlPlane, target: protocol.TabTarget) !?usize {
         return switch (target) {
             .none => null,
             .index => |i| i,
-            .id => |id| self.tab_mgr.resolve(id),
+            .id => |id| blk: {
+                const list = self.provider.listTabIds orelse break :blk self.tab_mgr.resolve(id);
+                if (!std.mem.startsWith(u8, id, "t_")) return error.NoSuchTab;
+                const value = std.fmt.parseInt(u64, id[2..], 10) catch return error.NoSuchTab;
+                var buf: [22]u8 = undefined;
+                if (!std.mem.eql(u8, id, formatTabId(&buf, value))) return error.NoSuchTab;
+                const ids = try list(self.provider.ctx, self.allocator);
+                defer self.allocator.free(ids);
+                break :blk std.mem.indexOfScalar(u64, ids, value) orelse return error.NoSuchTab;
+            },
         };
+    }
+
+    fn formatTabId(buf: *[22]u8, id: u64) []const u8 {
+        return std.fmt.bufPrint(buf, "t_{d:0>3}", .{id}) catch unreachable;
+    }
+
+    fn tabIdAt(self: *ControlPlane, index: usize, buf: *[22]u8) ![]const u8 {
+        const list = self.provider.listTabIds orelse return self.tab_mgr.getId(index) orelse "?";
+        const ids = try list(self.provider.ctx, self.allocator);
+        defer self.allocator.free(ids);
+        if (index >= ids.len) return error.NoSuchTab;
+        return formatTabId(buf, ids[index]);
     }
 
     /// Resolve tab, falling back to active tab via snapshot.
     /// Returns null if tab_count is 0 (no tabs available).
-    fn resolveTabOrActive(self: *ControlPlane, target: protocol.TabTarget) ?usize {
-        if (self.resolveTab(target)) |idx| return idx;
+    fn resolveTabOrActive(self: *ControlPlane, target: protocol.TabTarget) !?usize {
+        if (try self.resolveTab(target)) |idx| return idx;
         var snap: CombinedSnapshot = .{};
         _ = self.provider.captureSnapshot(self.provider.ctx, 0, &snap);
         snap.sanitize();
@@ -190,6 +213,7 @@ pub const ControlPlane = struct {
     /// Never panics. Returns an ERROR response on OOM or internal errors.
     pub fn handleRequest(self: *ControlPlane, request_line: []const u8) ![]u8 {
         return self.handleRequestInner(request_line) catch |err| {
+            if (err == error.NoSuchTab) return protocol.formatError(self.allocator, self.session_name, "NO_SUCH_TAB");
             log.err("handleRequest failed: {}", .{err});
             return protocol.formatError(self.allocator, self.session_name, "INTERNAL_ERROR");
         };
@@ -213,7 +237,7 @@ pub const ControlPlane = struct {
                 return try protocol.formatCapabilities(alloc, self.session_name);
             },
             .state => |tab_target| {
-                const tab_index = self.resolveTabOrActive(tab_target) orelse {
+                const tab_index = (try self.resolveTabOrActive(tab_target)) orelse {
                     log.warn("STATE: no tabs available", .{});
                     return try protocol.formatError(alloc, self.session_name, "NO_TABS");
                 };
@@ -229,7 +253,8 @@ pub const ControlPlane = struct {
                 const title = snap.title[0..snap.title_len];
                 const pwd = snap.pwd[0..snap.pwd_len];
                 const prompt = utils.inferPrompt(buffer, pwd);
-                const tab_id_str = self.tab_mgr.getId(tab_index) orelse "?";
+                var id_buf: [22]u8 = undefined;
+                const tab_id_str = try self.tabIdAt(tab_index, &id_buf);
                 const content_hash = std.hash.Fnv1a_32.hash(buffer);
 
                 const base = try protocol.formatState(
@@ -252,7 +277,7 @@ pub const ControlPlane = struct {
                 return try std.fmt.allocPrint(alloc, "{s}|mode={s}|content_hash={x:0>8}\n", .{ trimmed, mode_str, content_hash });
             },
             .capture_pane => |tab_target| {
-                const tab_index = self.resolveTabOrActive(tab_target) orelse {
+                const tab_index = (try self.resolveTabOrActive(tab_target)) orelse {
                     log.warn("CAPTURE_PANE: no tabs available", .{});
                     return try protocol.formatError(alloc, self.session_name, "NO_TABS");
                 };
@@ -278,7 +303,7 @@ pub const ControlPlane = struct {
                 return try protocol.formatCapturePane(alloc, self.session_name, epoch_ms, line_count, buffer);
             },
             .tail => |t| {
-                const tab_index = self.resolveTabOrActive(t.tab) orelse {
+                const tab_index = (try self.resolveTabOrActive(t.tab)) orelse {
                     log.warn("TAIL: no tabs available", .{});
                     return try protocol.formatError(alloc, self.session_name, "NO_TABS");
                 };
@@ -304,7 +329,7 @@ pub const ControlPlane = struct {
                 return try protocol.formatTail(alloc, self.session_name, line_count, lines);
             },
             .history => |h| {
-                const tab_index = self.resolveTabOrActive(h.tab) orelse {
+                const tab_index = (try self.resolveTabOrActive(h.tab)) orelse {
                     log.warn("HISTORY: no tabs available", .{});
                     return try protocol.formatError(alloc, self.session_name, "NO_TABS");
                 };
@@ -335,7 +360,7 @@ pub const ControlPlane = struct {
                 return try protocol.formatHistory(alloc, self.session_name, line_count, lines);
             },
             .wait_for => |w| {
-                const tab_index = self.resolveTabOrActive(w.tab) orelse {
+                const tab_index = (try self.resolveTabOrActive(w.tab)) orelse {
                     log.warn("WAIT_FOR: no tabs available", .{});
                     return try protocol.formatError(alloc, self.session_name, "NO_TABS");
                 };
@@ -367,7 +392,7 @@ pub const ControlPlane = struct {
                 return try protocol.formatError(alloc, self.session_name, "TIMEOUT");
             },
             .pane_pid => |tab_target| {
-                const tab_index = self.resolveTabOrActive(tab_target) orelse {
+                const tab_index = (try self.resolveTabOrActive(tab_target)) orelse {
                     log.warn("PANE_PID: no tabs available", .{});
                     return try protocol.formatError(alloc, self.session_name, "NO_TABS");
                 };
@@ -386,7 +411,7 @@ pub const ControlPlane = struct {
                 });
             },
             .cursor_pos => |tab_target| {
-                const tab_index = self.resolveTabOrActive(tab_target) orelse {
+                const tab_index = (try self.resolveTabOrActive(tab_target)) orelse {
                     log.warn("CURSOR_POS: no tabs available", .{});
                     return try protocol.formatError(alloc, self.session_name, "NO_TABS");
                 };
@@ -406,7 +431,7 @@ pub const ControlPlane = struct {
                 });
             },
             .pane_title => |tab_target| {
-                const tab_index = self.resolveTabOrActive(tab_target) orelse {
+                const tab_index = (try self.resolveTabOrActive(tab_target)) orelse {
                     log.warn("PANE_TITLE: no tabs available", .{});
                     return try protocol.formatError(alloc, self.session_name, "NO_TABS");
                 };
@@ -423,10 +448,12 @@ pub const ControlPlane = struct {
                 var meta_snap: CombinedSnapshot = .{};
                 _ = p.captureSnapshot(ctx, 0, &meta_snap);
                 meta_snap.sanitize();
-                const tab_count = meta_snap.tab_count;
+                const ids = if (p.listTabIds) |list| try list(ctx, alloc) else null;
+                defer if (ids) |tab_ids| alloc.free(tab_ids);
+                const tab_count = if (ids) |tab_ids| tab_ids.len else meta_snap.tab_count;
                 const active = meta_snap.active_tab;
 
-                try self.tab_mgr.syncTabs(tab_count);
+                if (ids == null) try self.tab_mgr.syncTabs(tab_count);
 
                 var result = std.ArrayListUnmanaged(u8){};
                 errdefer result.deinit(alloc);
@@ -444,7 +471,11 @@ pub const ControlPlane = struct {
                     const title = tab_snap.title[0..tab_snap.title_len];
                     const pwd = tab_snap.pwd[0..tab_snap.pwd_len];
                     const has_selection = tab_snap.has_selection;
-                    const tab_id_str = self.tab_mgr.getId(i) orelse "?";
+                    var id_buf: [22]u8 = undefined;
+                    const tab_id_str = if (ids) |tab_ids|
+                        formatTabId(&id_buf, tab_ids[i])
+                    else
+                        self.tab_mgr.getId(i) orelse "?";
 
                     var prompt = false;
                     if (i == active) {
@@ -460,17 +491,17 @@ pub const ControlPlane = struct {
                 return try result.toOwnedSlice(alloc);
             },
             .input => |inp| {
-                const tab_index = self.resolveTab(inp.tab);
+                const tab_index = try self.resolveTab(inp.tab);
                 const cmd_id = p.sendInput(ctx, inp.payload, false, tab_index);
                 return try formatQueuedWriteResponse(alloc, self.session_name, "INPUT", cmd_id);
             },
             .raw_input => |inp| {
-                const tab_index = self.resolveTab(inp.tab);
+                const tab_index = try self.resolveTab(inp.tab);
                 const cmd_id = p.sendInput(ctx, inp.payload, true, tab_index);
                 return try formatQueuedWriteResponse(alloc, self.session_name, "RAW_INPUT", cmd_id);
             },
             .paste => |inp| {
-                const tab_index = self.resolveTab(inp.tab);
+                const tab_index = try self.resolveTab(inp.tab);
                 const prefix = "\x1b[200~";
                 const suffix = "\x1b[201~";
                 var buf: [64 * 1024]u8 = undefined;
@@ -483,7 +514,7 @@ pub const ControlPlane = struct {
                 return try formatQueuedWriteResponse(alloc, self.session_name, "PASTE", cmd_id);
             },
             .send_keys => |s| {
-                const tab_index = self.resolveTab(s.tab);
+                const tab_index = try self.resolveTab(s.tab);
                 var payload = std.ArrayListUnmanaged(u8){};
                 defer payload.deinit(alloc);
 
@@ -505,16 +536,16 @@ pub const ControlPlane = struct {
                 return try std.fmt.allocPrint(alloc, "OK|{s}|NEW_TAB\n", .{self.session_name});
             },
             .close_tab => |tab_target| {
-                const tab_index = self.resolveTabOrActive(tab_target) orelse {
+                const tab_index = (try self.resolveTabOrActive(tab_target)) orelse {
                     log.warn("CLOSE_TAB: no tabs available", .{});
                     return try protocol.formatError(alloc, self.session_name, "NO_TABS");
                 };
-                self.tab_mgr.removeTabAtIndex(tab_index);
+                if (p.listTabIds == null) self.tab_mgr.removeTabAtIndex(tab_index);
                 p.closeTab(ctx, tab_index);
                 return try std.fmt.allocPrint(alloc, "ACK|{s}|CLOSE_TAB|{d}\n", .{ self.session_name, tab_index });
             },
             .switch_tab => |tab_target| {
-                const tab_index = self.resolveTabOrActive(tab_target) orelse {
+                const tab_index = (try self.resolveTabOrActive(tab_target)) orelse {
                     log.warn("SWITCH_TAB: no tabs available", .{});
                     return try protocol.formatError(alloc, self.session_name, "NO_TABS");
                 };
@@ -830,6 +861,39 @@ test "handleRequest LIST_TABS" {
     try std.testing.expect(std.mem.startsWith(u8, resp, "LIST_TABS|2|0"));
     try std.testing.expect(std.mem.indexOf(u8, resp, "TAB|0|") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "TAB|1|") != null);
+}
+
+fn mockListTabIds(_: *anyopaque, allocator: Allocator) Allocator.Error![]u64 {
+    const ids = [_]u64{ 2, 6 };
+    return allocator.dupe(u64, ids[ids.len - mock_state.tab_count ..]);
+}
+
+test "provider tab IDs survive a preceding tab closing" {
+    var cp = try initTestCp();
+    defer cp.deinit();
+    var provider = cp.provider.*;
+    provider.listTabIds = &mockListTabIds;
+    cp.provider = &provider;
+    const alloc = std.testing.allocator;
+
+    const before = try cp.handleRequest("LIST_TABS");
+    defer alloc.free(before);
+    try std.testing.expect(std.mem.indexOf(u8, before, "TAB|1|t_006|") != null);
+    try std.testing.expectEqual(@as(?usize, 1), try cp.resolveTab(.{ .id = "t_006" }));
+
+    mock_state.tab_count = 1;
+    const after = try cp.handleRequest("LIST_TABS");
+    defer alloc.free(after);
+    try std.testing.expect(std.mem.indexOf(u8, after, "TAB|0|t_006|") != null);
+    try std.testing.expectEqual(@as(?usize, 0), try cp.resolveTab(.{ .id = "t_006" }));
+    const history = try cp.handleRequest("HISTORY|50|id=t_002");
+    defer alloc.free(history);
+    try std.testing.expect(std.mem.indexOf(u8, history, "NO_SUCH_TAB") != null);
+    var input_request = "INPUT|test|aGk=|id=t_002".*;
+    const input = try cp.handleRequest(&input_request);
+    defer alloc.free(input);
+    try std.testing.expect(std.mem.indexOf(u8, input, "NO_SUCH_TAB") != null);
+    try std.testing.expect(mock_state.last_input == null);
 }
 
 test "handleRequest FOCUS" {
